@@ -11,6 +11,7 @@ XAxis,
 YAxis,
 } from "recharts";
 import { api, type ApiResponse } from "./api";
+import { InvestmentCenter, InvestmentPlanEditor, InvestmentSignal, useInvestmentOverview } from "./investment";
 import type { Actions } from "../../server/src/actions";
 
 const FIELDS = actionFields<typeof Actions>();
@@ -127,7 +128,7 @@ function MdLite({ text }: { text: string }) {
 
 type Alert = Dashboard["alerts"][number];
 type Earnings = Dashboard["earnings"][number];
-type Tab = "overview" | "stocks" | "positions" | "reports" | "news" | "rules" | "system" | "alerts";
+type Tab = "overview" | "stocks" | "positions" | "reports" | "news" | "rules" | "system" | "alerts" | "investing" | "plan";
 type StockView = "all" | "core" | "opportunity" | "custom" | "triggered" | "research";
 type OpenStock = (symbol: string) => void;
 
@@ -256,22 +257,24 @@ function MarketGrid({ data }: { data: Dashboard }) {
   );
 }
 
-function Overview({ data, openStock, openAlerts, openEvents, openSystem }: {
-  data: Dashboard; openStock: OpenStock; openAlerts: () => void; openEvents: () => void; openSystem: () => void;
+function Overview({ data, openStock, openAlerts, openEvents, openSystem, openInvesting }: {
+  data: Dashboard; openStock: OpenStock; openAlerts: () => void; openEvents: () => void; openSystem: () => void; openInvesting: () => void;
 }) {
   const calendar = data.calendar;
+  const investment = useInvestmentOverview();
+  const investmentSignals = investment.data?.signals.filter((signal) => signal.priority === "urgent" && signal.expiresAt > Date.now()).slice(0, 3) ?? [];
   const holdings = new Set(data.positions.map((position) => position.symbol));
   const core = new Set(data.stocks.filter((stock) => stock.grp === "core").map((stock) => stock.symbol));
   const rank = (alert: Alert) => (alert.level === "critical" ? 12 : alert.level === "warn" ? 4 : 0)
     + (alert.symbol && holdings.has(alert.symbol) ? 8 : alert.symbol && core.has(alert.symbol) ? 3 : 0);
-  const alerts = recentAlerts(data).sort((a, b) => rank(b) - rank(a) || b.id - a.id).slice(0, 3);
+  const alerts = recentAlerts(data).sort((a, b) => rank(b) - rank(a) || b.id - a.id).slice(0, 3 - investmentSignals.length);
   const near = new Date(`${calendar.todayET}T12:00:00Z`);
   near.setUTCDate(near.getUTCDate() + 1);
   const nearDate = near.toISOString().slice(0, 10);
   const relevant = new Set([...holdings, ...data.stocks.map((stock) => stock.symbol)]);
   const events = data.earnings.filter((event) => relevant.has(event.symbol) && event.reportDate >= calendar.todayET && event.reportDate <= nearDate)
     .sort((a, b) => Number(holdings.has(b.symbol)) - Number(holdings.has(a.symbol)) || a.reportDate.localeCompare(b.reportDate))
-    .slice(0, 3 - alerts.length);
+    .slice(0, 3 - alerts.length - investmentSignals.length);
   const quoteTime = latestByTime(data.stocks);
   const closeTime = Date.parse(`${calendar.todayET}T${calendar.closeTimeET}:00Z`);
   const earlyCloseTime = beijingClock.format(new Date(closeTime + (calendar.isDST ? 4 : 5) * 3600000));
@@ -288,9 +291,15 @@ function Overview({ data, openStock, openAlerts, openEvents, openSystem }: {
         {coreIssues.size > 0 ? <button type="button" className="monitor-link" onClick={openSystem}>核心或持仓报价待核对 {coreIssues.size} 项</button> : null}
       </div>
       <section>
-        <Heading title="今日关注"><button type="button" className="monitor-link" onClick={openAlerts}>预警记录</button></Heading>
-        {alerts.length === 0 && events.length === 0 ? <Empty>暂无新触发。</Empty> : (
+        <Heading title="今日关注">
+          <div className="flex gap-1">
+            <button type="button" className="monitor-link" onClick={openAlerts}>预警记录</button>
+            <button type="button" className="monitor-link" onClick={openInvesting}>投资信号</button>
+          </div>
+        </Heading>
+        {investmentSignals.length === 0 && alerts.length === 0 && events.length === 0 ? <Empty>暂无新触发。</Empty> : (
           <Panel className="monitor-rows">
+            {investmentSignals.map((signal) => <InvestmentSignal signal={signal} key={signal.id} compact />)}
             {alerts.map((alert) => (
               <article key={alert.id} className="px-4 py-3">
                 <AlertTitle alert={alert} openStock={data.stocks.some((stock) => stock.symbol === alert.symbol) ? openStock : undefined} />
@@ -314,8 +323,8 @@ function Overview({ data, openStock, openAlerts, openEvents, openSystem }: {
   );
 }
 
-function StockDetail({ stock, alert, threshold, onClose }: {
-  stock: Stock; alert?: Alert; threshold: number; onClose: () => void;
+function StockDetail({ stock, alert, threshold, onClose, openPlan }: {
+  stock: Stock; alert?: Alert; threshold: number; onClose: () => void; openPlan: () => void;
 }) {
   const [range, setRange] = useState<"month" | "quarter" | "year">("quarter");
   const detail = useQuery({
@@ -327,7 +336,12 @@ function StockDetail({ stock, alert, threshold, onClose }: {
   const nextEarning = detail.data?.earnings[0];
   return (
     <>
-      <Heading title={`${stock.symbol} · ${stockName(stock)}`}><button type="button" className="monitor-link" onClick={onClose}>返回自选</button></Heading>
+      <Heading title={`${stock.symbol} · ${stockName(stock)}`}>
+        <div className="flex flex-wrap justify-end gap-1">
+          <button type="button" className="monitor-link" onClick={onClose}>返回自选</button>
+          <button type="button" className="monitor-link" onClick={openPlan}>投资计划</button>
+        </div>
+      </Heading>
       <Panel className="space-y-3 p-4">
         <div className="flex flex-wrap items-baseline gap-x-3">
           <span className="num text-2xl font-semibold">{money(stock.price)}</span>
@@ -378,8 +392,8 @@ function StockDetail({ stock, alert, threshold, onClose }: {
   );
 }
 
-function StocksTab({ data, selected, setSelected, openEvents }: {
-  data: Dashboard; selected: string | null; setSelected: (symbol: string | null) => void; openEvents: () => void;
+function StocksTab({ data, selected, setSelected, openEvents, openPlan }: {
+  data: Dashboard; selected: string | null; setSelected: (symbol: string | null) => void; openEvents: () => void; openPlan: (symbol: string) => void;
 }) {
   const queryClient = useQueryClient();
   const [view, setView] = useState<StockView>("all");
@@ -405,7 +419,7 @@ function StocksTab({ data, selected, setSelected, openEvents }: {
   }
   const detailStock = data.stocks.find((stock) => stock.symbol === selected);
   if (detailStock) {
-    return <StockDetail key={detailStock.symbol} stock={detailStock} alert={alerted.get(detailStock.symbol)} threshold={data.rules.ddWatchPct} onClose={() => setSelected(null)} />;
+    return <StockDetail key={detailStock.symbol} stock={detailStock} alert={alerted.get(detailStock.symbol)} threshold={data.rules.ddWatchPct} onClose={() => setSelected(null)} openPlan={() => openPlan(detailStock.symbol)} />;
   }
 
   const threshold = data.rules.ddWatchPct;
@@ -876,7 +890,7 @@ function RulesTab({ data }: { data: Dashboard }) {
   );
 }
 
-function SystemTab({ data, openAlerts }: { data: Dashboard; openAlerts: () => void }) {
+function SystemTab({ data, openAlerts, openInvesting }: { data: Dashboard; openAlerts: () => void; openInvesting: () => void }) {
   const queryClient = useQueryClient();
   const system = useQuery({ queryKey: ["system-status"], queryFn: () => api.getSystemStatus({}) });
   const test = useMutation({
@@ -912,6 +926,7 @@ function SystemTab({ data, openAlerts }: { data: Dashboard; openAlerts: () => vo
         <div className="px-4 py-3">
           <p className="text-xs text-[var(--dim)]">聊天通知</p>
           <p className="mt-1 text-sm">送达待核实 · 查看 Muse 主助手的任务记录</p>
+          <button type="button" className="monitor-link" onClick={openInvesting}>QQ 邮件状态</button>
         </div>
       </Panel>
       {failed.length > 0 ? (
@@ -961,8 +976,9 @@ let autoRefreshTried = false;
 
 export function App() {
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<Tab>("overview");
+  const [tab, setTab] = useState<Tab>(() => new URLSearchParams(window.location.search).get("view") === "investing" ? "investing" : "overview");
   const [selected, setSelected] = useState<string | null>(null);
+  const [planSymbol, setPlanSymbol] = useState<string | null>(null);
   const dash = useQuery({ queryKey: ["dashboard"], queryFn: () => api.getDashboard({}) });
   const refresh = useMutation({
     mutationFn: (force: boolean) => api.refreshMarket({ force }),
@@ -987,7 +1003,11 @@ export function App() {
     setTab("stocks");
     window.scrollTo({ top: 0 });
   }
-  const activeTab = tab === "news" ? "stocks" : tab === "alerts" ? "overview" : tab;
+  function openPlan(symbol: string | null = null) {
+    setPlanSymbol(symbol);
+    navigate("plan");
+  }
+  const activeTab = tab === "news" ? "stocks" : ["alerts", "investing", "plan"].includes(tab) ? "overview" : tab;
   return (
     <div className="monitor-app">
       <SafeAreaTopScrim backgroundColor="var(--bg)" />
@@ -1018,14 +1038,16 @@ export function App() {
           <Empty><button type="button" className="monitor-link" onClick={() => dash.refetch()}>数据加载失败，重试</button></Empty>
         ) : data ? (
           <>
-            {tab === "overview" ? <Overview data={data} openStock={openStock} openAlerts={() => navigate("alerts")} openEvents={() => navigate("news")} openSystem={() => navigate("system")} /> : null}
-            {tab === "stocks" ? <StocksTab data={data} selected={selected} setSelected={(symbol) => { setSelected(symbol); window.scrollTo({ top: 0 }); }} openEvents={() => navigate("news")} /> : null}
+            {tab === "overview" ? <Overview data={data} openStock={openStock} openAlerts={() => navigate("alerts")} openEvents={() => navigate("news")} openSystem={() => navigate("system")} openInvesting={() => navigate("investing")} /> : null}
+            {tab === "stocks" ? <StocksTab data={data} selected={selected} setSelected={(symbol) => { setSelected(symbol); window.scrollTo({ top: 0 }); }} openEvents={() => navigate("news")} openPlan={openPlan} /> : null}
+            {tab === "investing" ? <InvestmentCenter openPlan={() => openPlan()} /> : null}
+            {tab === "plan" ? <InvestmentPlanEditor symbol={planSymbol} onBack={() => navigate("investing")} /> : null}
             {tab === "positions" ? <PositionsTab data={data} openStock={openStock} /> : null}
             {tab === "reports" ? <ReportsTab data={data} /> : null}
             {tab === "news" ? <NewsTab data={data} onBack={() => navigate("stocks")} /> : null}
             {tab === "alerts" ? <AlertsTab data={data} openStock={openStock} onBack={() => navigate("overview")} /> : null}
             {tab === "rules" ? <RulesTab data={data} /> : null}
-            {tab === "system" ? <SystemTab data={data} openAlerts={() => navigate("alerts")} /> : null}
+            {tab === "system" ? <SystemTab data={data} openAlerts={() => navigate("alerts")} openInvesting={() => navigate("investing")} /> : null}
           </>
         ) : null}
       </main>

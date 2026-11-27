@@ -179,3 +179,63 @@ export const alertState = sqliteTable("alert_state", {
     .notNull()
     .$defaultFn(() => new Date()),
 });
+
+export const investmentPlans = sqliteTable("investment_plans", {
+  symbol: text("symbol").primaryKey(),
+  enabled: integer("enabled", { mode: "boolean" }).notNull(),
+  purpose: text("purpose", { enum: ["long", "trade", "watch"] }).notNull(),
+  thesis: text("thesis").notNull(),
+  entryLow: real("entry_low"),
+  entryHigh: real("entry_high"),
+  riskPrice: real("risk_price"),
+  peakGivebackPct: real("peak_giveback_pct"),
+  openingDropPct: real("opening_drop_pct"),
+  includeExtended: integer("include_extended", { mode: "boolean" }).notNull(),
+  nextEvent: text("next_event").notNull(),
+  nextEventDate: text("next_event_date"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+export const investmentQuoteState = sqliteTable("investment_quote_state", {
+  symbol: text("symbol").primaryKey(),
+  observedAt: integer("observed_at").notNull(),
+  lotSignature: text("lot_signature").notNull(),
+  peakPnl: real("peak_pnl"),
+  entryActive: integer("entry_active", { mode: "boolean" }).notNull(),
+  riskActive: integer("risk_active", { mode: "boolean" }).notNull(),
+  givebackActive: integer("giveback_active", { mode: "boolean" }).notNull(),
+});
+
+export const investmentMail = sqliteTable("investment_mail", {
+  id: text("id").primaryKey(),
+  digestKey: text("digest_key").unique(),
+  mode: text("mode", { enum: ["urgent", "digest"] }).notNull(),
+  status: text("status", { enum: ["sending", "sent", "not_sent", "uncertain", "expired"] }).notNull(),
+  claimToken: text("claim_token").notNull(),
+  attempts: integer("attempts").notNull(),
+  capturedAt: integer("captured_at").notNull(),
+  leaseUntil: integer("lease_until").notNull(),
+  retryAfter: integer("retry_after"),
+  providerRef: text("provider_ref"),
+  error: text("error"),
+  sentAt: integer("sent_at"),
+  confirmedAt: integer("confirmed_at"),
+});
+
+export const investmentSignals = sqliteTable("investment_signals", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  eventKey: text("event_key").notNull().unique(),
+  symbol: text("symbol").notNull(),
+  kind: text("kind", { enum: ["price_zone", "risk_price", "opening_drop", "profit_giveback", "halt", "sec_filing", "test"] }).notNull(),
+  priority: text("priority", { enum: ["urgent", "digest"] }).notNull(),
+  tradeDate: text("trade_date").notNull(),
+  title: text("title").notNull(),
+  impact: text("impact").notNull(),
+  nextStep: text("next_step").notNull(),
+  source: text("source").notNull(),
+  sourceUrl: text("source_url"),
+  observedAt: integer("observed_at").notNull(),
+  detectedAt: integer("detected_at").notNull(),
+  expiresAt: integer("expires_at").notNull(),
+  mailId: text("mail_id").references(() => investmentMail.id),
+});

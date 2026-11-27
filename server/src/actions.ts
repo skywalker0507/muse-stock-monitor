@@ -13,6 +13,7 @@
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
 import { and, asc, desc, eq, gte, inArray } from "drizzle-orm";
 import * as schema from "./schema";
+import { createInvestmentActions } from "./investment";
 
 type Db = ReturnType<Ctx["db"]>;
 
@@ -267,7 +268,7 @@ type TickerContent = {
 async function fetchTicker(
   ctx: Ctx,
   symbol: string,
-  opts?: { interval: "1d"; since: string },
+  opts?: { interval?: "1d"; since?: string; timeout_secs?: number },
 ): Promise<TickerContent> {
   const fn = ctx.tool.finance_ticker as unknown as (
     s: string,
@@ -1485,6 +1486,19 @@ type DashboardOut = z.infer<typeof dashboardResponse>;
 // ---------- Actions ----------
 
 export const Actions = {
+  ...createInvestmentActions({
+    sessionAt(time) {
+      const calendar = marketStatusNow(time);
+      return {
+        date: calendar.todayET,
+        phase: calendar.phase,
+        previousTradingDay: prevTradingDay(calendar.todayET),
+        lastClosedTradingDay: calendar.lastClosedTradingDay,
+        minutesET: etClock(time).minutes,
+      };
+    },
+    quote: (ctx, symbol) => fetchTicker(ctx, symbol, { timeout_secs: 12 }),
+  }),
   getDashboard: defineAction({
     description: "读取监控中心全部数据：行情、指标、市场风险、持仓、预警、新闻、财报、报告与刷新记录。",
     request: z.object({}),
