@@ -1,0 +1,15 @@
+{
+  "runtime": "typescript",
+  "platformVersion": 31,
+  "entry": "client/dist/index.html",
+  "name": "美股投资监控中心",
+  "slug": "mei-gu-tou-zi-jian-kong-zhong-xin",
+  "managedCronJobs": [
+    {
+      "id": "mei-gu-postmarket-refresh",
+      "action": "scheduledRefresh",
+      "schedule": "daily 05:30 Asia/Shanghai",
+      "args": {}
+    }
+  ]
+}

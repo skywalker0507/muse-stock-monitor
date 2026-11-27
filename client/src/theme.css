@@ -1,0 +1,78 @@
+@import "tailwindcss";
+@import "tailwindcss-safe-area";
+
+@theme {
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+  --text-sm: 14px;
+  --text-sm--line-height: 20px;
+  --text-base: 16px;
+  --text-base--line-height: 24px;
+  --text-lg: 18px;
+  --text-lg--line-height: 28px;
+  --text-xl: 20px;
+  --text-xl--line-height: 28px;
+  --text-2xl: 24px;
+  --text-2xl--line-height: 32px;
+  --text-3xl: 30px;
+  --text-3xl--line-height: 36px;
+}
+
+:root {
+  color-scheme: light dark;
+  --bg: #edf0f5;
+  --surface: #ffffff;
+  --surface2: #f4f6fa;
+  --text: #16202e;
+  --dim: #5b6b7d;
+  --border: #d5dde8;
+  --accent: #b97a1e;
+  --up: #d92d20;
+  --down: #12805c;
+  --radius: 10px;
+  --space-surface: var(--surface);
+  --space-surface-alt: var(--surface2);
+  --space-muted: var(--dim);
+  --space-border: var(--border);
+  --space-accent: var(--accent);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1420;
+    --surface: #131c2b;
+    --surface2: #182437;
+    --text: #e8eef5;
+    --dim: #9fb0c3;
+    --border: #24314a;
+    --accent: #e8a33d;
+    --up: #f0564f;
+    --down: #3fb97f;
+  }
+}
+
+.num {
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 页面级防横向溢出：任何子元素都不得撑出横向滚动条（clip 不破坏 sticky 顶栏） */
+html,
+body {
+  overflow-x: clip;
+}
+
+/* 可横向滑动的页签栏隐藏滚动条，滑动提示由渐隐罩承担 */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+@layer base {
+  button, [role="button"], select, summary, input:not([type="checkbox"], [type="radio"]) {
+    min-height: 2.25rem;
+  }
+}
