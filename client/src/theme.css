@@ -62,17 +62,290 @@ body {
   overflow-x: clip;
 }
 
-/* 可横向滑动的页签栏隐藏滚动条，滑动提示由渐隐罩承担 */
-.no-scrollbar {
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-}
-.no-scrollbar::-webkit-scrollbar {
-  display: none;
-}
-
 @layer base {
   button, [role="button"], select, summary, input:not([type="checkbox"], [type="radio"]) {
     min-height: 2.25rem;
   }
+}
+
+.monitor-app {
+  min-height: 100svh;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.monitor-width {
+  width: min(100%, 57rem);
+  margin-inline: auto;
+  padding-inline: clamp(1rem, 3.5vw, 1.75rem);
+}
+
+.monitor-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.monitor-content {
+  display: grid;
+  gap: 1rem;
+  padding-block: 1rem max(5.5rem, calc(4.5rem + env(safe-area-inset-bottom)));
+}
+
+.monitor-nav {
+  position: fixed;
+  inset: auto 0 0;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.25rem;
+  padding: 0.375rem 0.75rem max(0.375rem, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.monitor-nav button,
+.monitor-filters button {
+  border-radius: 0.5rem;
+  padding: 0.375rem 0.625rem;
+  font-size: var(--text-sm);
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.monitor-nav button[aria-current],
+.monitor-filters button[aria-pressed="true"] {
+  background: var(--surface2);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+@media (min-width: 640px) {
+  .monitor-nav {
+    position: static;
+    display: flex;
+    padding: 0;
+    border: 0;
+    background: none;
+  }
+
+  .monitor-content {
+    padding-block: 1.5rem 2.5rem;
+  }
+}
+
+.monitor-heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+section > .monitor-heading {
+  margin-bottom: 0.5rem;
+}
+
+.monitor-heading h2 {
+  min-width: 0;
+  font-size: var(--text-lg);
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.monitor-panel {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.monitor-rows > :not(:first-child) {
+  border-top: 1px solid var(--border);
+}
+
+.monitor-tag {
+  display: inline-block;
+  flex: none;
+  border-radius: 0.25rem;
+  padding: 0.125rem 0.375rem;
+  background: var(--surface2);
+  color: var(--dim);
+  font-size: var(--text-xs);
+  line-height: 1.25rem;
+  white-space: nowrap;
+}
+
+.monitor-tag-risk {
+  color: var(--up);
+}
+
+.monitor-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.monitor-metric {
+  min-width: 0;
+  padding: 0.75rem 0.875rem;
+  border-inline-end: 1px solid var(--border);
+}
+
+.monitor-metrics:not(.monitor-metrics-three) .monitor-metric:nth-child(n + 3) {
+  border-top: 1px solid var(--border);
+}
+
+.monitor-metrics:not(.monitor-metrics-three) .monitor-metric:nth-child(2n),
+.monitor-metrics-three .monitor-metric:last-child {
+  border-inline-end: 0;
+}
+
+.monitor-metrics-three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.monitor-link,
+.monitor-secondary,
+.monitor-primary {
+  border-radius: 0.5rem;
+  padding-inline: 0.6rem;
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+
+.monitor-link {
+  color: var(--dim);
+  padding-inline: 0.3rem;
+}
+
+.monitor-link:hover,
+.monitor-link:focus-visible {
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 0.2rem;
+}
+
+.monitor-secondary,
+.monitor-input {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.monitor-primary {
+  background: var(--text);
+  color: var(--surface);
+}
+
+.monitor-app button:disabled {
+  opacity: 0.55;
+}
+
+.monitor-input {
+  padding-inline: 0.625rem;
+}
+
+.monitor-field {
+  display: grid;
+  gap: 0.375rem;
+  font-size: var(--text-sm);
+}
+
+.monitor-field input {
+  width: min(100%, 16rem);
+}
+
+.monitor-field small {
+  color: var(--dim);
+  font-size: var(--text-xs);
+}
+
+.monitor-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.monitor-filters button {
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.monitor-stock-row {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) minmax(4.4rem, auto) 4.5rem;
+  align-items: center;
+  gap: 0.5rem;
+  text-align: left;
+  padding-block: 0.625rem;
+}
+
+.monitor-icon-button {
+  flex: none;
+  min-width: 2rem;
+  font-size: 1.15rem;
+  color: var(--dim);
+}
+
+.monitor-disclosure > summary {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 0.75rem 1rem;
+  list-style: none;
+  cursor: pointer;
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.monitor-disclosure > summary::-webkit-details-marker,
+.monitor-settings > summary::-webkit-details-marker {
+  display: none;
+}
+
+.monitor-disclosure > summary::after {
+  content: "+";
+  margin-inline-start: auto;
+  color: var(--dim);
+}
+
+.monitor-disclosure[open] > summary::after {
+  content: "−";
+}
+
+.monitor-settings {
+  position: relative;
+}
+
+.monitor-settings > summary {
+  display: grid;
+  place-items: center;
+  list-style: none;
+  cursor: pointer;
+}
+
+.monitor-settings-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 0.375rem);
+  min-width: 8.5rem;
+  padding: 0.375rem;
+  box-shadow: 0 7px 21px color-mix(in srgb, var(--text) 12%, transparent);
+}
+
+.monitor-settings-menu button {
+  display: block;
+  width: 100%;
+  padding-inline: 0.625rem;
+  text-align: left;
+  font-size: var(--text-sm);
+}
+
+.monitor-settings-menu button:hover {
+  background: var(--surface2);
 }

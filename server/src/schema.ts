@@ -31,6 +31,7 @@ export const quotes = sqliteTable("quotes", {
   beta: real("beta"),
   marketStatus: text("market_status"),
   asOf: text("as_of"),
+  observedAtMs: integer("observed_at_ms"),
   sourceUrl: text("source_url"),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" })
     .notNull()
@@ -45,6 +46,7 @@ export const dailyBars = sqliteTable("daily_bars", {
   close: real("close").notNull(),
   high: real("high"),
   low: real("low"),
+  verifiedAtMs: integer("verified_at_ms"),
 });
 
 // 计算指标（回撤 / 均线 / RSI），刷新时由日线确定性计算
@@ -57,6 +59,7 @@ export const indicators = sqliteTable("indicators", {
   ma50: real("ma50"),
   ma200: real("ma200"),
   rsi14: real("rsi14"),
+  quoteObservedAtMs: integer("quote_observed_at_ms"),
   tier: integer("tier").notNull().default(0), // 0 无 / 1 轻度5 / 2 关注10 / 3 重点15 / 4 深度20 / 5 重大30
   updatedAt: integer("updated_at", { mode: "timestamp_ms" })
     .notNull()
@@ -162,7 +165,7 @@ export const reports = sqliteTable("reports", {
 export const refreshRuns = sqliteTable("refresh_runs", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   kind: text("kind").notNull(), // market / news / report / full
-  status: text("status", { enum: ["ok", "error"] }).notNull(),
+  status: text("status", { enum: ["ok", "partial", "error", "skipped"] }).notNull(),
   detail: text("detail").notNull().default(""),
   startedAt: integer("started_at", { mode: "timestamp_ms" }).notNull(),
   finishedAt: integer("finished_at", { mode: "timestamp_ms" }).notNull(),
@@ -178,4 +181,76 @@ export const alertState = sqliteTable("alert_state", {
   updatedAt: integer("updated_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
+});
+
+export const investmentPlans = sqliteTable("investment_plans", {
+  symbol: text("symbol").primaryKey(),
+  enabled: integer("enabled", { mode: "boolean" }).notNull(),
+  purpose: text("purpose", { enum: ["long", "trade", "watch"] }).notNull(),
+  thesis: text("thesis").notNull(),
+  entryLow: real("entry_low"),
+  entryHigh: real("entry_high"),
+  riskPrice: real("risk_price"),
+  peakGivebackPct: real("peak_giveback_pct"),
+  openingDropPct: real("opening_drop_pct"),
+  includeExtended: integer("include_extended", { mode: "boolean" }).notNull(),
+  nextEvent: text("next_event").notNull(),
+  nextEventDate: text("next_event_date"),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+export const investmentQuoteState = sqliteTable("investment_quote_state", {
+  symbol: text("symbol").primaryKey(),
+  observedAt: integer("observed_at").notNull(),
+  price: real("price"),
+  riskStartedAt: integer("risk_started_at"),
+  lotSignature: text("lot_signature").notNull(),
+  peakPnl: real("peak_pnl"),
+  entryActive: integer("entry_active", { mode: "boolean" }).notNull(),
+  riskActive: integer("risk_active", { mode: "boolean" }).notNull(),
+  givebackActive: integer("giveback_active", { mode: "boolean" }).notNull(),
+});
+
+export const investmentMail = sqliteTable("investment_mail", {
+  id: text("id").primaryKey(),
+  digestKey: text("digest_key").unique(),
+  mode: text("mode", { enum: ["urgent", "digest"] }).notNull(),
+  status: text("status", { enum: ["sending", "sent", "not_sent", "uncertain", "expired"] }).notNull(),
+  claimToken: text("claim_token").notNull(),
+  attempts: integer("attempts").notNull(),
+  capturedAt: integer("captured_at").notNull(),
+  leaseUntil: integer("lease_until").notNull(),
+  retryAfter: integer("retry_after"),
+  providerRef: text("provider_ref"),
+  error: text("error"),
+  sentAt: integer("sent_at"),
+  confirmedAt: integer("confirmed_at"),
+});
+
+export const investmentSignals = sqliteTable("investment_signals", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  eventKey: text("event_key").notNull().unique(),
+  symbol: text("symbol").notNull(),
+  kind: text("kind", { enum: ["price_zone", "risk_price", "opening_drop", "profit_giveback", "halt", "sec_filing", "test"] }).notNull(),
+  priority: text("priority", { enum: ["urgent", "digest"] }).notNull(),
+  tradeDate: text("trade_date").notNull(),
+  title: text("title").notNull(),
+  impact: text("impact").notNull(),
+  nextStep: text("next_step").notNull(),
+  source: text("source").notNull(),
+  sourceUrl: text("source_url"),
+  observedAt: integer("observed_at").notNull(),
+  detectedAt: integer("detected_at").notNull(),
+  expiresAt: integer("expires_at").notNull(),
+  riskStartedAt: integer("risk_started_at"),
+  mailId: text("mail_id").references(() => investmentMail.id),
+});
+
+
+export const investmentHeartbeats = sqliteTable("investment_heartbeats", {
+  job: text("job", { enum: ["price", "halt", "sec", "mail"] }).primaryKey(),
+  status: text("status", { enum: ["ok", "partial", "error", "skipped"] }).notNull(),
+  attemptedAt: integer("attempted_at").notNull(),
+  lastSuccessAt: integer("last_success_at"),
+  detail: text("detail").notNull(),
 });
