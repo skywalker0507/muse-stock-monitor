@@ -11,9 +11,10 @@
 //   降级为确定性事实汇总并写明失败原因，绝不静默为空。
 
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
-import { and, asc, desc, eq, gte, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lte, or } from "drizzle-orm";
 import * as schema from "./schema";
 import { createInvestmentActions } from "./investment";
+import { compatiblePreviousClose, secureSourceUrl, validatedHistory, validatedQuote } from "./market-evidence";
 
 type Db = ReturnType<Ctx["db"]>;
 
@@ -62,9 +63,6 @@ function hashStr(s: string): string {
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
   return `h${(h >>> 0).toString(36)}`;
 }
-
-const num = (v: number | null | undefined): number | null =>
-  typeof v === "number" && Number.isFinite(v) ? v : null;
 
 // ---------- NYSE 交易日历（确定性，代码内置） ----------
 // 休市日与提前收盘日为 NYSE 官方公布日历（2026 / 2027）；夏令时按美国法定
@@ -236,46 +234,13 @@ function marketStatusNow(now = new Date()): MarketStatus {
 
 // ---------- finance_ticker 封装 ----------
 
-type TickerPoint = {
-  date: string | null;
-  close: number | null;
-  high: number | null;
-  low: number | null;
-};
-type TickerInstrument = {
-  name: string;
-  symbol: string | null;
-  price: number | null;
-  change: number | null;
-  change_percent: number | null;
-  high: number | null;
-  low: number | null;
-  week_52_high: number | null;
-  week_52_low: number | null;
-  market_cap: number | null;
-  beta: number | null;
-  market_status: string | null;
-  as_of: string | null;
-  url: string | null;
-  history?: { points: TickerPoint[] } | null;
-};
-type TickerContent = {
-  resolved: { symbol: string; matched: string };
-  instrument: TickerInstrument | null;
-  sources: { title: string; url: string }[];
-};
-
 async function fetchTicker(
   ctx: Ctx,
   symbol: string,
   opts?: { interval?: "1d"; since?: string; timeout_secs?: number },
-): Promise<TickerContent> {
-  const fn = ctx.tool.finance_ticker as unknown as (
-    s: string,
-    o?: unknown,
-  ) => Promise<{ content: TickerContent }>;
-  const res = await fn(symbol, opts);
-  return res.content;
+): Promise<unknown> {
+  const response = await ctx.tool.finance_ticker(symbol, opts);
+  return response.content;
 }
 
 type SearchResult = {
@@ -397,7 +362,7 @@ async function evalCrossing(
   value: number | null,
   level: number,
   cooldownMs: number,
-  priorLevel?: (value: number) => number,
+  options: { priorLevel?: (value: number) => number; urgentLevel?: number } = {},
 ): Promise<{ crossed: boolean; prevValue: number | null }> {
   const rows = await db.select().from(schema.alertState).where(eq(schema.alertState.key, key)).limit(1);
   const st = rows[0];
@@ -415,10 +380,11 @@ async function evalCrossing(
   }
   let crossed = false;
   let lastFiredAt = st.lastFiredAt;
-  const lastLevel = priorLevel && st.prevValue != null ? priorLevel(st.prevValue) : st.firedLevel;
+  const lastLevel = options.priorLevel && st.prevValue != null ? options.priorLevel(st.prevValue) : st.firedLevel;
   if (level > lastLevel) {
     const cooled = !st.lastFiredAt || now.getTime() - st.lastFiredAt.getTime() >= cooldownMs;
-    if (cooled) {
+    const upgraded = options.urgentLevel != null && level >= options.urgentLevel;
+    if (cooled || upgraded) {
       crossed = true;
       lastFiredAt = now;
     }
@@ -472,172 +438,111 @@ async function insertAlertMaxLevel(
 
 // ---------- 单标的刷新 ----------
 
-async function refreshSymbol(
-  ctx: Ctx,
-  db: Db,
-  symbol: string,
-): Promise<{ ok: boolean; price: number | null; changePct: number | null; dd52: number | null; tier: number; error?: string }> {
-  // 报价拉取带一次重试：单标的瞬时失败（如 v1 的 MSFT）不应让整只标的为空
-  let inst: TickerInstrument | null = null;
-  let lastErr = "";
-  for (let attempt = 0; attempt < 2 && !inst; attempt++) {
+type SymbolRefresh = {
+  ok: boolean;
+  price: number | null;
+  changePct: number | null;
+  dd52: number | null;
+  tier: number;
+  riskComparable?: boolean;
+  alertDay?: string;
+  error?: string;
+};
+
+async function refreshSymbol(ctx: Ctx, db: Db, symbol: string): Promise<SymbolRefresh> {
+  const failed = (error: string): SymbolRefresh => ({ ok: false, price: null, changePct: null, dd52: null, tier: 0, error });
+  let quote: ReturnType<typeof validatedQuote> = null;
+  let error = "报价未通过标的、币种或时间校验";
+  for (let attempt = 0; attempt < 2 && !quote; attempt++) {
     try {
-      const quote = await fetchTicker(ctx, symbol);
-      if (quote.instrument && quote.instrument.price != null) {
-        inst = quote.instrument;
-      } else {
-        lastErr = quote.instrument ? "行情源返回价格为空" : "行情源未匹配到该代码";
-      }
-    } catch (e) {
-      lastErr = e instanceof Error ? e.message.slice(0, 100) : "行情请求失败";
+      quote = validatedQuote(await fetchTicker(ctx, symbol, { timeout_secs: 12 }), symbol, Date.now());
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message.slice(0, 100) : "行情请求失败";
     }
   }
-  if (!inst || inst.price == null) {
-    return { ok: false, price: null, changePct: null, dd52: null, tier: 0, error: lastErr || "行情不可用" };
-  }
-  const hist = await fetchTicker(ctx, symbol, { interval: "1d", since: daysAgoISO(400) });
-  const points = (hist.instrument?.history?.points ?? []).filter(
-    (p) => p.date && p.close != null,
-  ) as { date: string; close: number; high: number | null; low: number | null }[];
+  if (!quote) return failed(error);
 
-  if (points.length > 0) {
-    for (const p of points) {
-      await db
-        .insert(schema.dailyBars)
-        .values({ symbol, date: p.date, close: p.close, high: p.high, low: p.low })
-        .onConflictDoUpdate({
-          target: [schema.dailyBars.symbol, schema.dailyBars.date],
-          set: { close: p.close, high: p.high, low: p.low },
-        });
-    }
-    // 只保留最近 400 个交易日
-    const cutoff = points[Math.max(0, points.length - 400)]?.date;
-    if (cutoff) {
-      const all = await db
-        .select({ id: schema.dailyBars.id, date: schema.dailyBars.date })
-        .from(schema.dailyBars)
-        .where(eq(schema.dailyBars.symbol, symbol));
-      const staleIds = all.filter((b) => b.date < cutoff).map((b) => b.id);
-      if (staleIds.length > 0) {
-        await db.delete(schema.dailyBars).where(inArray(schema.dailyBars.id, staleIds));
-      }
+  const historyAttempt = Date.now();
+  let history: ReturnType<typeof validatedHistory> = null;
+  try {
+    const raw = await fetchTicker(ctx, symbol, { interval: "1d", since: daysAgoISO(430), timeout_secs: 20 });
+    history = validatedHistory(raw, symbol, marketStatusNow(new Date(historyAttempt)).lastClosedTradingDay, isTradingDay);
+  } catch {
+    // Quote and history are independent. A valid quote remains usable when history is unavailable.
+  }
+  if (history?.points.length) {
+    const table = schema.dailyBars;
+    for (let offset = 0; offset < history.points.length; offset += 70) {
+      const writes = history.points.slice(offset, offset + 70).map((point) =>
+        db.insert(table).values({ symbol, ...point, verifiedAtMs: historyAttempt }).onConflictDoUpdate({
+          target: [table.symbol, table.date],
+          set: { ...point, verifiedAtMs: historyAttempt },
+          setWhere: or(isNull(table.verifiedAtMs), lte(table.verifiedAtMs, historyAttempt)),
+        }));
+      const [first, ...rest] = writes;
+      if (first) await db.batch([first, ...rest]);
     }
   }
 
-  // 指标一律以数据库中的日线为准（与刚写入的口径一致，含历史积累）
-  const bars = await db
-    .select()
-    .from(schema.dailyBars)
-    .where(eq(schema.dailyBars.symbol, symbol))
-    .orderBy(asc(schema.dailyBars.date));
-  const closes = bars.map((b) => b.close);
-  const highs = bars.map((b) => b.high ?? b.close);
-  const price = inst.price;
-
-  // 52 周高/低：近 252 个交易日日K极值（高用 high、低用 low），并入当日
-  // 行情的高/低（日K通常滞后一个交易日）。记录极值所在日期以便核查。
-  const win = bars.slice(-252);
-  let h52: number | null = null;
-  let h52Date: string | null = null;
-  let l52: number | null = null;
-  let l52Date: string | null = null;
-  for (const b of win) {
-    const hv = b.high ?? b.close;
-    if (h52 == null || hv > h52) {
-      h52 = hv;
-      h52Date = b.date;
-    }
-    const lv = b.low ?? b.close;
-    if (l52 == null || lv < l52) {
-      l52 = lv;
-      l52Date = b.date;
-    }
+  const observed = marketStatusNow(new Date(quote.observedAt));
+  const regularOrAfter = observed.phase === "open" || observed.phase === "afterhours";
+  const quoteDay = regularOrAfter ? observed.todayET : observed.lastClosedTradingDay;
+  const bars = (await db.select().from(schema.dailyBars).where(and(
+    eq(schema.dailyBars.symbol, symbol), isNotNull(schema.dailyBars.verifiedAtMs), lte(schema.dailyBars.date, quoteDay),
+  )).orderBy(desc(schema.dailyBars.date)).limit(400)).reverse();
+  const barsBeforeQuoteDay = bars.find((bar) => bar.date === prevTradingDay(quoteDay));
+  const riskComparable = regularOrAfter && compatiblePreviousClose(quote, barsBeforeQuoteDay?.close ?? null);
+  const week = bars.length >= 252 && riskComparable ? bars.slice(-252) : [];
+  let weekHigh: { price: number; date: string } | null = null;
+  let weekLow: { price: number; date: string } | null = null;
+  for (const bar of week) {
+    const high = bar.high ?? bar.close;
+    const low = bar.low ?? bar.close;
+    if (!weekHigh || high > weekHigh.price) weekHigh = { price: high, date: bar.date };
+    if (!weekLow || low < weekLow.price) weekLow = { price: low, date: bar.date };
   }
-  // 当日高/低所属的交易日：报价快照时间落在休市日或盘前时，归属最近交易日
-  let quoteDate = etDate();
-  if (inst.as_of) {
-    const asOfDate = new Date(inst.as_of);
-    if (!Number.isNaN(asOfDate.getTime())) {
-      const st = marketStatusNow(asOfDate);
-      quoteDate = st.lastTradingDay;
-    }
-  }
-  if (num(inst.high) != null && (h52 == null || (inst.high as number) > h52)) {
-    h52 = inst.high;
-    h52Date = quoteDate;
-  }
-  if (num(inst.low) != null && (l52 == null || (inst.low as number) < l52)) {
-    l52 = inst.low;
-    l52Date = quoteDate;
-  }
-
-  await db
-    .insert(schema.quotes)
-    .values({
-      symbol,
-      name: inst.name ?? symbol,
-      price: num(inst.price),
-      change: num(inst.change),
-      changePct: num(inst.change_percent),
-      dayHigh: num(inst.high),
-      dayLow: num(inst.low),
-      week52High: h52,
-      week52Low: l52,
-      week52HighDate: h52Date,
-      week52LowDate: l52Date,
-      marketCap: num(inst.market_cap),
-      beta: num(inst.beta),
-      marketStatus: inst.market_status,
-      asOf: inst.as_of,
-      sourceUrl: inst.url,
-      updatedAt: new Date(),
-    })
-    .onConflictDoUpdate({
-      target: schema.quotes.symbol,
-      set: {
-        name: inst.name ?? symbol,
-        price: num(inst.price),
-        change: num(inst.change),
-        changePct: num(inst.change_percent),
-        dayHigh: num(inst.high),
-        dayLow: num(inst.low),
-        week52High: h52,
-        week52Low: l52,
-        week52HighDate: h52Date,
-        week52LowDate: l52Date,
-        marketCap: num(inst.market_cap),
-        beta: num(inst.beta),
-        marketStatus: inst.market_status,
-        asOf: inst.as_of,
-        sourceUrl: inst.url,
-        updatedAt: new Date(),
-      },
-    });
-
-  if (inst.name) {
-    await db.update(schema.watchlist).set({ name: inst.name }).where(eq(schema.watchlist.symbol, symbol));
-  }
-
-  const dd = (h: number | null) => (h && h > 0 ? Math.max(0, ((h - price) / h) * 100) : null);
-  const dd52v = dd(h52);
-  const tier = ddTier(dd52v);
-  const indValues = {
-    dd52: dd52v,
-    dd20: dd(windowHigh(highs, closes, 20)),
-    dd60: dd(windowHigh(highs, closes, 60)),
-    ma20: sma(closes, 20),
-    ma50: sma(closes, 50),
-    ma200: sma(closes, 200),
-    rsi14: rsi14(closes),
-    tier,
-    updatedAt: new Date(),
+  if (week.length && quote.high != null && weekHigh && quote.high > weekHigh.price) weekHigh = { price: quote.high, date: quoteDay };
+  if (week.length && quote.low != null && weekLow && quote.low < weekLow.price) weekLow = { price: quote.low, date: quoteDay };
+  const price = quote.price;
+  const quoteValues = {
+    name: quote.name ?? symbol,
+    price, change: quote.change ?? null, changePct: quote.change_percent ?? null,
+    dayHigh: regularOrAfter ? quote.high ?? null : null,
+    dayLow: regularOrAfter ? quote.low ?? null : null,
+    week52High: weekHigh?.price ?? null, week52Low: weekLow?.price ?? null,
+    week52HighDate: weekHigh?.date ?? null, week52LowDate: weekLow?.date ?? null,
+    marketCap: quote.market_cap ?? null, beta: quote.beta ?? null,
+    marketStatus: observed.phase, asOf: new Date(quote.observedAt).toISOString(), observedAtMs: quote.observedAt,
+    sourceUrl: secureSourceUrl(quote.url)?.href ?? null, updatedAt: new Date(),
   };
-  await db
-    .insert(schema.indicators)
-    .values({ symbol, ...indValues })
-    .onConflictDoUpdate({ target: schema.indicators.symbol, set: indValues });
+  const quotes = schema.quotes;
+  const written = await db.insert(quotes).values({ symbol, ...quoteValues }).onConflictDoUpdate({
+    target: quotes.symbol, set: quoteValues,
+    setWhere: or(isNull(quotes.observedAtMs), lte(quotes.observedAtMs, quote.observedAt)),
+  }).returning({ symbol: quotes.symbol });
+  if (!written.length) return failed("收到的报价早于已验证快照，保留原值");
 
-  return { ok: true, price, changePct: num(inst.change_percent), dd52: dd52v, tier };
+  if (quote.name) await db.update(schema.watchlist).set({ name: quote.name }).where(eq(schema.watchlist.symbol, symbol));
+  const closes = bars.map((bar) => bar.close);
+  const highs = bars.map((bar) => bar.high ?? bar.close);
+  const dd = (high: number | null) => riskComparable && high != null && high > 0 ? Math.max(0, (high - price) / high * 100) : null;
+  const dd52 = dd(weekHigh?.price ?? null);
+  const tier = ddTier(dd52);
+  const indicators = schema.indicators;
+  const values = {
+    dd52, tier, dd20: closes.length >= 20 ? dd(windowHigh(highs, closes, 20)) : null,
+    dd60: closes.length >= 60 ? dd(windowHigh(highs, closes, 60)) : null,
+    ma20: sma(closes, 20), ma50: sma(closes, 50), ma200: sma(closes, 200), rsi14: rsi14(closes),
+    quoteObservedAtMs: quote.observedAt, updatedAt: new Date(),
+  };
+  await db.insert(indicators).values({ symbol, ...values }).onConflictDoUpdate({
+    target: indicators.symbol, set: values,
+    setWhere: or(isNull(indicators.quoteObservedAtMs), lte(indicators.quoteObservedAtMs, quote.observedAt)),
+  });
+
+  const alertDay = regularOrAfter && quoteDay === etDate() ? quoteDay : undefined;
+  return { ok: true, price, changePct: quote.change_percent ?? null, dd52, tier, riskComparable, alertDay,
+    error: !history?.points.length ? "日线缺失或未通过校验" : !riskComparable && regularOrAfter ? "当日报价和前收口径待核对" : undefined };
 }
 
 // ---------- 行情刷新（含规则评估与预警去重） ----------
@@ -656,7 +561,7 @@ async function refreshMarketInternal(ctx: Ctx, force: boolean) {
       .limit(1);
     const lastRun = last[0];
     if (lastRun && lastRun.status === "ok" && Date.now() - lastRun.finishedAt.getTime() < 10 * 60 * 1000) {
-      return { updated: 0, failed: [] as string[], skipped: true, newAlerts: 0 };
+      return { updated: 0, failed: [] as string[], warnings: [] as string[], skipped: true, newAlerts: 0 };
     }
   }
 
@@ -666,9 +571,9 @@ async function refreshMarketInternal(ctx: Ctx, force: boolean) {
   const symbols = [...new Set([...watchedSymbols, ...positions.map((row) => row.symbol)])];
   const rulesRows = await db.select().from(schema.rules).limit(1);
   const rules = rulesRows[0] ?? { movePct: 5, indexDropPct: 2, vixLevels: "20,25,30,40", ddWatchPct: 10 };
-  const today = etDate();
   const failed: string[] = [];
   const failReasons: string[] = [];
+  const warnings: string[] = [];
   let updated = 0;
   let newAlerts = 0;
 
@@ -679,12 +584,14 @@ async function refreshMarketInternal(ctx: Ctx, force: boolean) {
         if (!r.ok) {
           failed.push(symbol);
           if (r.error) failReasons.push(`${symbol}：${r.error}`);
+        } else if (r.error) {
+          warnings.push(`${symbol}：${r.error}`);
         }
         return { symbol, ...r };
       } catch (e) {
         failed.push(symbol);
         failReasons.push(`${symbol}：${e instanceof Error ? e.message.slice(0, 80) : "未知错误"}`);
-        return { symbol, ok: false, price: null, changePct: null, dd52: null, tier: 0 };
+        return { symbol, ok: false, price: null, changePct: null, dd52: null, tier: 0, riskComparable: false, alertDay: undefined };
       }
     }),
   );
@@ -692,12 +599,13 @@ async function refreshMarketInternal(ctx: Ctx, force: boolean) {
 
   const drawdownLevel = (value: number) => value >= rules.ddWatchPct ? Math.max(1, ddTier(value)) : 0;
   for (const r of results) {
-    if (!r.ok || !watchedSymbols.has(r.symbol)) continue;
+    if (!r.ok || !r.alertDay || !watchedSymbols.has(r.symbol)) continue;
+    const today = r.alertDay;
     // 个股异动：等级 1 = 达到阈值，2 = 达到阈值的 1.6 倍（严重）
     if (r.changePct != null) {
       const mag = Math.abs(r.changePct);
       const lvl = mag >= rules.movePct * 1.6 ? 2 : mag >= rules.movePct ? 1 : 0;
-      const ev = await evalCrossing(db, `move:${r.symbol}`, r.changePct, lvl, COOLDOWN_MS.fast);
+      const ev = await evalCrossing(db, `move:${r.symbol}`, r.changePct, lvl, COOLDOWN_MS.fast, { urgentLevel: 2 });
       if (ev.crossed && lvl > 0) {
         const inserted = await insertAlertMaxLevel(db, {
           dedupKey: `move:${r.symbol}:${today}:${lvl}`,
@@ -716,7 +624,7 @@ async function refreshMarketInternal(ctx: Ctx, force: boolean) {
     // 回撤先检查用户阈值，再判断后续分级升级，冷却 24 小时
     if (r.dd52 != null) {
       const rank = drawdownLevel(r.dd52);
-      const ev = await evalCrossing(db, `dd:${r.symbol}`, r.dd52, rank, COOLDOWN_MS.slow, drawdownLevel);
+      const ev = await evalCrossing(db, `dd:${r.symbol}`, r.dd52, rank, COOLDOWN_MS.slow, { priorLevel: drawdownLevel, urgentLevel: 4 });
       if (ev.crossed && rank > 0) {
         const inserted = await insertAlertMaxLevel(db, {
           dedupKey: `dd:${r.symbol}:${today}:${rank}`,
@@ -735,11 +643,12 @@ async function refreshMarketInternal(ctx: Ctx, force: boolean) {
   }
 
   // 持仓：更新期间最高价 + 从高点回撤预警（跨越触发，24 小时冷却）
-  const refreshedSymbols = new Set(results.filter((row) => row.ok).map((row) => row.symbol));
+  const comparable = new Map(results.filter((row) => row.ok && row.alertDay && row.riskComparable).map((row) => [row.symbol, row.alertDay]));
   const quoteRows = await db.select().from(schema.quotes);
   const quoteMap = new Map(quoteRows.map((q) => [q.symbol, q]));
   for (const p of positions) {
-    if (!refreshedSymbols.has(p.symbol)) continue;
+    const today = comparable.get(p.symbol);
+    if (!today) continue;
     const q = quoteMap.get(p.symbol);
     if (!q || q.price == null) continue;
     const newPeak = Math.max(p.peakPrice ?? 0, q.price, q.dayHigh ?? 0);
@@ -769,16 +678,16 @@ async function refreshMarketInternal(ctx: Ctx, force: boolean) {
     }
   }
 
-  const status = failed.length === 0 ? "ok" : updated === 0 ? "error" : "partial";
+  const status = failed.length === 0 && warnings.length === 0 ? "ok" : updated === 0 ? "error" : "partial";
   await logRun(
     db,
     "market",
     status,
-    `更新 ${updated}/${symbols.length} 个标的${failed.length ? `；失败：${failReasons.join("；") || failed.join(",")}` : ""}；新增预警 ${newAlerts} 条`,
+    `更新 ${updated}/${symbols.length} 个标的${failed.length ? `；失败：${failReasons.join("；") || failed.join(",")}` : ""}${warnings.length ? `；待核对 ${warnings.join("；")}` : ""}；新增预警 ${newAlerts} 条`,
     started,
   );
   ctx.invalidateQueries();
-  return { updated, failed, skipped: false, newAlerts };
+  return { updated, failed, warnings, skipped: false, newAlerts };
 }
 
 // 指数下跌预警评估（指数值由资讯刷新从公开来源提炼后调用）
@@ -790,7 +699,7 @@ async function evalIndexAlerts(db: Db, indexChange: Record<string, number | null
     const chg = indexChange[key];
     if (chg == null) continue;
     const lvl = chg <= -rules.indexDropPct * 1.5 ? 2 : chg <= -rules.indexDropPct ? 1 : 0;
-    const ev = await evalCrossing(db, `idx:${key}`, chg, lvl, COOLDOWN_MS.fast);
+    const ev = await evalCrossing(db, `idx:${key}`, chg, lvl, COOLDOWN_MS.fast, { urgentLevel: 2 });
     if (ev.crossed && lvl > 0) {
       const label = key === "SPX" ? "标普500指数" : "纳斯达克100指数";
       const inserted = await insertAlertMaxLevel(db, {
@@ -979,6 +888,13 @@ async function refreshNewsInternal(ctx: Ctx) {
   const miSource = "公开来源提炼（指数收盘口径，可能延迟）";
   if (indOut.status === "fulfilled" && indOut.value) {
     const distilled = indOut.value;
+    const closeDay = marketStatusNow(attemptedAt).lastClosedTradingDay;
+    const dated = (value: number | null, date: string | null) => date === closeDay ? value : null;
+    if (
+      dated(distilled.spx.value, distilled.spx.as_of) == null ||
+      dated(distilled.nas100.value, distilled.nas100.as_of) == null ||
+      dated(distilled.vix.value, distilled.vix.as_of) == null
+    ) errors.push("部分指数未取得最近交易日的收盘证据");
     const put = async (
       key: string,
       value: number | null,
@@ -1006,18 +922,17 @@ async function refreshNewsInternal(ctx: Ctx) {
         })
         .where(eq(schema.marketIndicators.key, key));
     };
-    await put("SPX", distilled.spx.value, distilled.spx.as_of, distilled.spx.change_pct);
-    await put("NAS100", distilled.nas100.value, distilled.nas100.as_of, distilled.nas100.change_pct);
-    await put("VIX", distilled.vix.value, distilled.vix.as_of);
+    await put("SPX", dated(distilled.spx.value, distilled.spx.as_of), distilled.spx.as_of, distilled.spx.change_pct);
+    await put("NAS100", dated(distilled.nas100.value, distilled.nas100.as_of), distilled.nas100.as_of, distilled.nas100.change_pct);
+    await put("VIX", dated(distilled.vix.value, distilled.vix.as_of), distilled.vix.as_of);
     await put("TNX10Y", distilled.tnx10y.value, distilled.tnx10y.as_of, null, "单位：%");
 
     // 指数下跌预警（状态机跨越触发）
-    const today = etDate();
-    await evalIndexAlerts(
-      db,
-      { SPX: distilled.spx.change_pct, NAS100: distilled.nas100.change_pct },
-      today,
-    );
+    const today = closeDay;
+    await evalIndexAlerts(db, {
+      SPX: distilled.spx.value == null ? null : dated(distilled.spx.change_pct, distilled.spx.as_of),
+      NAS100: distilled.nas100.value == null ? null : dated(distilled.nas100.change_pct, distilled.nas100.as_of),
+    }, today);
 
     // VIX 预警（状态机）：等级 = 已跨越的最高阈值序号；只在实际向上跨越
     // 时触发，同日只保留最高等级一条；跌回最低阈值以下自动恢复。
@@ -1027,13 +942,14 @@ async function refreshNewsInternal(ctx: Ctx) {
       .map((s) => Number(s.trim()))
       .filter((n) => Number.isFinite(n) && n > 0)
       .sort((a, b) => a - b);
-    const vix = distilled.vix.value;
+    const vix = dated(distilled.vix.value, distilled.vix.as_of);
     if (vix != null && levels.length > 0) {
       let lvl = 0;
       levels.forEach((th, i) => {
         if (vix >= th) lvl = i + 1;
       });
-      const ev = await evalCrossing(db, "vix", vix, lvl, COOLDOWN_MS.fast);
+      const severe = levels.findIndex((threshold) => threshold >= 30);
+      const ev = await evalCrossing(db, "vix", vix, lvl, COOLDOWN_MS.fast, { urgentLevel: severe < 0 ? undefined : severe + 1 });
       if (ev.crossed && lvl > 0) {
         const highest = levels[lvl - 1] ?? 0;
         await insertAlertMaxLevel(db, {
@@ -1042,7 +958,7 @@ async function refreshNewsInternal(ctx: Ctx) {
           kind: "vix",
           level: highest >= 30 ? "critical" : "warn",
           title: `VIX 升至 ${vix.toFixed(1)}，突破 ${highest} 阈值`,
-          detail: `由 ${ev.prevValue != null ? ev.prevValue.toFixed(1) : "—"} 向上跨越 ${highest} 阈值触发（同日只保留最高等级一条；6 小时冷却；跌回 ${levels[0]} 以下恢复）。恐慌指数处于高位，注意市场波动与流动性风险。`,
+          detail: `由 ${ev.prevValue != null ? ev.prevValue.toFixed(1) : "—"} 向上跨越 ${highest} 阈值触发（同日保留最高等级；普通升级有 6 小时冷却；跌回 ${levels[0]} 以下恢复）。恐慌指数处于高位，注意市场波动与流动性风险。`,
           match: (k) => k.startsWith("vix:") && k.endsWith(`:${today}`),
           rank: highest,
           rankOf: (k) => Number(k.split(":")[1] ?? 0) || 0,
@@ -1095,15 +1011,17 @@ async function generateReportInternal(ctx: Ctx, kind: "daily" | "weekly") {
     .orderBy(asc(schema.earnings.reportDate))
     .limit(15);
 
-  const qMap = new Map(quoteRows.map((q) => [q.symbol, q]));
+  const qMap = new Map(quoteRows.filter((q) => q.observedAtMs != null && etDate(new Date(q.observedAtMs)) === today).map((q) => [q.symbol, q]));
   const iMap = new Map(indRows.map((i) => [i.symbol, i]));
   const stockLines = watch.map((w) => {
     const q = qMap.get(w.symbol);
-    const ind = iMap.get(w.symbol);
+    const saved = iMap.get(w.symbol);
+    const ind = q?.observedAtMs != null && saved?.quoteObservedAtMs === q.observedAtMs ? saved : undefined;
     return {
       代码: w.symbol,
       分组: w.grp === "core" ? "核心" : w.grp === "opportunity" ? "机会" : "自定义",
       价格USD: q?.price ?? null,
+      报价时间: q?.asOf ?? null,
       当日涨跌pct: q?.changePct ?? null,
       距52周高回撤pct: ind?.dd52 ?? null,
       RSI14: ind?.rsi14 ?? null,
@@ -1121,6 +1039,7 @@ async function generateReportInternal(ctx: Ctx, kind: "daily" | "weekly") {
       数量: p.shares,
       成本价: p.cost,
       现价: q?.price ?? null,
+      报价时间: q?.asOf ?? null,
       浮盈亏USD: mv != null ? Math.round((mv - costTotal) * 100) / 100 : null,
       周期: p.horizon === "long" ? "长期核心" : "短中期",
     };
@@ -1246,8 +1165,8 @@ async function scheduledRefreshInternal(ctx: Ctx) {
     const result = await refreshMarketInternal(ctx, true);
     marketUpdated = result.updated;
     if (result.updated > 0) servicesSucceeded++;
-    if (result.failed.length > 0) errors++;
-    parts.push(`行情更新 ${result.updated} 个标的，新增预警 ${result.newAlerts} 条${result.failed.length ? `，失败 ${result.failed.join("、")}` : ""}`);
+    if (result.failed.length > 0 || result.warnings.length > 0) errors++;
+    parts.push(`行情更新 ${result.updated} 个标的，新增预警 ${result.newAlerts} 条${result.failed.length ? `，失败 ${result.failed.join("、")}` : ""}${result.warnings.length ? `，待核对 ${result.warnings.join("、")}` : ""}`);
   } catch (error) {
     errors++;
     parts.push(`行情失败：${error instanceof Error ? error.message.slice(0, 100) : "未知错误"}`);
@@ -1509,13 +1428,13 @@ export const Actions = {
       const watch = await db.select().from(schema.watchlist).orderBy(asc(schema.watchlist.id));
       const quoteRows = await db.select().from(schema.quotes);
       const indRows = await db.select().from(schema.indicators);
-      const qMap = new Map(quoteRows.map((q) => [q.symbol, q]));
+      const qMap = new Map(quoteRows.filter((q) => q.observedAtMs != null).map((q) => [q.symbol, q]));
       const iMap = new Map(indRows.map((i) => [i.symbol, i]));
 
       const bars = watch.length === 0 ? [] : await db
         .select({ symbol: schema.dailyBars.symbol, close: schema.dailyBars.close })
         .from(schema.dailyBars)
-        .where(inArray(schema.dailyBars.symbol, watch.map((row) => row.symbol)))
+        .where(and(inArray(schema.dailyBars.symbol, watch.map((row) => row.symbol)), isNotNull(schema.dailyBars.verifiedAtMs)))
         .orderBy(asc(schema.dailyBars.date));
       const sparkMap = new Map<string, number[]>();
       for (const b of bars) {
@@ -1526,7 +1445,8 @@ export const Actions = {
 
       const stocks = watch.map((w) => {
         const q = qMap.get(w.symbol);
-        const ind = iMap.get(w.symbol);
+        const saved = iMap.get(w.symbol);
+        const ind = q?.observedAtMs != null && saved?.quoteObservedAtMs === q.observedAtMs ? saved : undefined;
         const sparkAll = sparkMap.get(w.symbol) ?? [];
         return {
           symbol: w.symbol,
@@ -1639,7 +1559,7 @@ export const Actions = {
       const runRows = await db.select().from(schema.refreshRuns).orderBy(desc(schema.refreshRuns.id)).limit(10);
       const activeSymbols = new Set([...watch, ...posRows].map((row) => row.symbol));
       const lastQuote = quoteRows.reduce<Date | null>((acc, q) => {
-        if (!activeSymbols.has(q.symbol)) return acc;
+        if (!activeSymbols.has(q.symbol) || q.observedAtMs == null) return acc;
         if (!acc || q.updatedAt > acc) return q.updatedAt;
         return acc;
       }, null);
@@ -1710,6 +1630,7 @@ export const Actions = {
     response: z.object({
       updated: z.number(),
       failed: z.array(z.string()),
+      warnings: z.array(z.string()),
       skipped: z.boolean(),
       newAlerts: z.number(),
     }),
@@ -2003,7 +1924,7 @@ export const Actions = {
       const bars = await db
         .select({ date: schema.dailyBars.date, close: schema.dailyBars.close })
         .from(schema.dailyBars)
-        .where(eq(schema.dailyBars.symbol, sym))
+        .where(and(eq(schema.dailyBars.symbol, sym), isNotNull(schema.dailyBars.verifiedAtMs)))
         .orderBy(asc(schema.dailyBars.date));
       const earns = await db
         .select()
@@ -2032,18 +1953,16 @@ export const Actions = {
       if (!/^[A-Z0-9.\-]{1,10}$/.test(sym)) throw new Error("代码格式不正确");
       const existing = await db.select().from(schema.watchlist).where(eq(schema.watchlist.symbol, sym)).limit(1);
       if (existing.length > 0) throw new Error(`${sym} 已在监控列表中`);
-      const t = await fetchTicker(ctx, sym);
-      if (!t.instrument || t.instrument.price == null) {
-        throw new Error(`行情源未找到代码 ${sym}，请确认代码正确`);
-      }
-      await db.insert(schema.watchlist).values({ symbol: sym, name: t.instrument.name ?? sym, grp: "custom" });
+      const t = validatedQuote(await fetchTicker(ctx, sym, { timeout_secs: 12 }), sym, Date.now());
+      if (!t) throw new Error(`行情源未返回代码 ${sym} 的可信美元报价，请核对标的。`);
+      await db.insert(schema.watchlist).values({ symbol: sym, name: t.name ?? sym, grp: "custom" });
       try {
         await refreshSymbol(ctx, db, sym);
       } catch {
         // 行情已验证存在，历史拉取失败不阻塞添加，后续刷新会补齐
       }
       ctx.invalidateQueries();
-      return { symbol: sym, name: t.instrument.name ?? sym };
+      return { symbol: sym, name: t.name ?? sym };
     },
   }),
 
@@ -2073,7 +1992,7 @@ export const Actions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const sym = args.symbol.toUpperCase();
-      const q = await db.select().from(schema.quotes).where(eq(schema.quotes.symbol, sym)).limit(1);
+      const q = await db.select().from(schema.quotes).where(and(eq(schema.quotes.symbol, sym), isNotNull(schema.quotes.observedAtMs))).limit(1);
       const inserted = await db
         .insert(schema.positions)
         .values({

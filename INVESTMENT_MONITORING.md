@@ -15,13 +15,13 @@
 
 ## 安装和任务
 
-1. 保留既有 slug 和数据库。合入源码和追加迁移 `0004_investment_signals_and_mail.sql`，由 Muse 构建工具执行 build → audit → 发布。以 Space 所有者及其授权任务分别验证新增 Action 的身份和可调用性。
+1. 保留既有 slug 和数据库。合入源码并依序应用 `0004_investment_signals_and_mail.sql` 与 `0005_market_evidence_and_risk_health.sql`，由 Muse 构建工具执行 build → audit → 发布。以 Space 所有者及其授权任务分别验证新增 Action 的身份和可调用性。
 2. 把 `scripts/collect_investment_events.py` 放进 Muse VM 的工作区。在 Muse 私密设置中配置 `SEC_EDGAR_USER_AGENT`，值为服务名称加维护者联系方式。QQ 收件地址与已授权的邮件连接器放在 Muse 任务配置中。
 3. 在 Muse 主助手上安排价格与官方事件检查。先实测能支持的间隔，再记录实际检测和邮件延迟。常规时段至少覆盖开盘第一小时，公告轮询应覆盖你关心的盘后时段。每天收盘后的摘要任务也可以合并到已有盘后任务，但发送由有连接器的主助手执行。
 
 ### 每轮检查
 
-1. 调用 `scanInvestmentPrices({})`。结束后先发送已排队的紧急邮件。
+1. 调用 `scanInvestmentPrices({"worker":true})`。结束后先发送已排队的紧急邮件。界面手动检查使用默认参数，只更新信号和运行记录。
 2. 调用 `getInvestmentTargets({})`，仅把返回的 `targets` 数组交给采集脚本。使用任务私有的临时文件，在执行后删除。文件形状为 `{"targets":[{"symbol":"GOOG","held":true,"planned":true}]}`。
 3. 先跑 `--source halt`。把 stdout 解析后的 JSON 对象原样传给 `importInvestmentEvents`，包括来源失败时的 `sourceErrors`。发送新入队的紧急邮件后，再跑 `--source sec`，导入结果并发送新入队的紧急邮件。这样 SEC 逐只查询不会拖住已发现的价格和停牌预警。Nasdaq RSS 每分钟最多查询一次。
 
@@ -39,6 +39,14 @@
 - 发信服务明确接受时，立刻调用 `recordInvestmentMail`，传回 `id`、`claimToken`、`outcome: "sent"` 和邮件服务实际返回的 `providerRef`。
 - 明确没发出时填 `outcome: "not_sent"` 和简短的 `error`。同一消息编号在有效期内最多尝试三次。服务超时、结果无法判断，或领取后任务中断，使用 `uncertain` 或等待领取失效。先凭消息编号查发件箱或收件箱，再补记结果。待核对状态会保留供人工查验。
 - Space 记录服务接受和收件人确认的时间。收到 QQ 邮件后可以在「QQ 邮件与监测状态」按消息编号确认。邮箱地址、授权信息和测试邮件的内容留在 Muse 私密环境。
+
+### 监测状态与过期补报
+
+- 每轮邮件任务结束调用 `recordInvestmentMailHeartbeat({"status":"ok","detail":"本轮处理完成"})`，空队列也记录。已知有部分未发或结果待查时用 `partial`，连接器打不开等整轮失败用 `error`。分开导入 `--source halt` 与 `--source sec` 可以分别记各自的源心跳。
+- 首页有独立的「监测待核对」状态。当前交易时段，超过 45 分钟没有任务心跳会显示超时。此默认值对应拟定的 30 分钟检查周期。若需要主动发现整轮任务停跑，由独立的 Muse 健康检查任务读取 `getInvestmentOverview` 的 `health.jobs` 并告知用户。该检查任务依赖实际排程和连接器。
+- 上线后点击「刷新行情」，让已验证的报价和日线替换现有展示数据。旧记录仍保留供迁移核对。急跌规则要求已核验的上一个交易日收盘价，且计算跌幅与实时通道涨跌幅相差不超过 0.5 个百分点。口径不符会跳过该条急跌并标记覆盖不全，个人风险价仍可独立评估。
+- 邮件超过有效期时，持续风险仍保留在首页和「投资信号」。新鲜报价确认仍低于风险线，且上一封明确未发时，会入队一封延迟复核邮件。风险已恢复、计划被停用或风险线改动时，旧的待发邮件会失去发送资格。已送交邮件服务或状态不确定的邮件继续按原编号核对。
+- 「QQ 真实收件待验收」以用户最近确认的测试邮件为依据。测试确认超过 7 天后界面提示复查。发送任务心跳和 QQ 收件确认分别显示。
 
 ### 真实 QQ 验收
 

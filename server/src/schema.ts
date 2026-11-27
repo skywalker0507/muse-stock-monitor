@@ -31,6 +31,7 @@ export const quotes = sqliteTable("quotes", {
   beta: real("beta"),
   marketStatus: text("market_status"),
   asOf: text("as_of"),
+  observedAtMs: integer("observed_at_ms"),
   sourceUrl: text("source_url"),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" })
     .notNull()
@@ -45,6 +46,7 @@ export const dailyBars = sqliteTable("daily_bars", {
   close: real("close").notNull(),
   high: real("high"),
   low: real("low"),
+  verifiedAtMs: integer("verified_at_ms"),
 });
 
 // 计算指标（回撤 / 均线 / RSI），刷新时由日线确定性计算
@@ -57,6 +59,7 @@ export const indicators = sqliteTable("indicators", {
   ma50: real("ma50"),
   ma200: real("ma200"),
   rsi14: real("rsi14"),
+  quoteObservedAtMs: integer("quote_observed_at_ms"),
   tier: integer("tier").notNull().default(0), // 0 无 / 1 轻度5 / 2 关注10 / 3 重点15 / 4 深度20 / 5 重大30
   updatedAt: integer("updated_at", { mode: "timestamp_ms" })
     .notNull()
@@ -199,6 +202,8 @@ export const investmentPlans = sqliteTable("investment_plans", {
 export const investmentQuoteState = sqliteTable("investment_quote_state", {
   symbol: text("symbol").primaryKey(),
   observedAt: integer("observed_at").notNull(),
+  price: real("price"),
+  riskStartedAt: integer("risk_started_at"),
   lotSignature: text("lot_signature").notNull(),
   peakPnl: real("peak_pnl"),
   entryActive: integer("entry_active", { mode: "boolean" }).notNull(),
@@ -237,5 +242,15 @@ export const investmentSignals = sqliteTable("investment_signals", {
   observedAt: integer("observed_at").notNull(),
   detectedAt: integer("detected_at").notNull(),
   expiresAt: integer("expires_at").notNull(),
+  riskStartedAt: integer("risk_started_at"),
   mailId: text("mail_id").references(() => investmentMail.id),
+});
+
+
+export const investmentHeartbeats = sqliteTable("investment_heartbeats", {
+  job: text("job", { enum: ["price", "halt", "sec", "mail"] }).primaryKey(),
+  status: text("status", { enum: ["ok", "partial", "error", "skipped"] }).notNull(),
+  attemptedAt: integer("attempted_at").notNull(),
+  lastSuccessAt: integer("last_success_at"),
+  detail: text("detail").notNull(),
 });

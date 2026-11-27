@@ -4,6 +4,7 @@ import { api, type ApiRequest, type ApiResponse } from "./api";
 
 type InvestmentOverview = ApiResponse<typeof api, "getInvestmentOverview">;
 type Signal = InvestmentOverview["signals"][number];
+type MonitorHealth = InvestmentOverview["health"];
 type Plan = ApiRequest<typeof api, "saveInvestmentPlan">;
 type Target = ApiResponse<typeof api, "getInvestmentTargets">["targets"][number];
 
@@ -15,8 +16,38 @@ const targetKey = ["investment-targets"];
 
 export function useInvestmentOverview() {
   return useQuery({
-    queryKey: overviewKey, queryFn: () => api.getInvestmentOverview({}), retry: false, staleTime: 30000,
+    queryKey: overviewKey, queryFn: () => api.getInvestmentOverview({}), retry: false, staleTime: 30000, refetchInterval: 60_000,
   });
+}
+
+const jobNames: Record<MonitorHealth["jobs"][number]["job"], string> = {
+  price: "盘中行情", halt: "交易暂停", sec: "SEC 公告", mail: "邮件任务",
+};
+const healthLabels: Record<MonitorHealth["jobs"][number]["state"], string> = {
+  unconfigured: "未收到任务心跳", healthy: "正常", partial: "覆盖不全",
+  error: "执行失败", overdue: "超时未更新", paused: "当前休市或未启用",
+};
+
+export function monitorIssue(health: MonitorHealth) {
+  const failed = health.jobs.filter((job) => job.state !== "healthy" && job.state !== "paused");
+  const names = failed.map((job) => jobNames[job.job]);
+  if (!health.qqTestFresh) names.push(health.qqTestConfirmedAt ? "QQ 收件验证已过期" : "QQ 真实收件待验收");
+  return names.join("、");
+}
+
+function HealthDetails({ health }: { health: MonitorHealth }) {
+  return (
+    <div className="space-y-2 border-t border-[var(--border)] pt-3">
+      <p className="text-sm font-medium">监测心跳</p>
+      {health.jobs.map((job) => (
+        <div className="text-xs leading-5 text-[var(--dim)]" key={job.job}>
+          <p>{jobNames[job.job]} · {healthLabels[job.state]}{job.lastSuccessAt ? ` · 最近完整成功 ${times.format(job.lastSuccessAt)}` : ""}</p>
+          {job.detail ? <p>{job.detail}</p> : null}
+        </div>
+      ))}
+      <p className="text-xs text-[var(--dim)]">{health.qqTestConfirmedAt ? `QQ 测试收件：${times.format(health.qqTestConfirmedAt)}（北京时间）` : "QQ 测试收件待确认。"}</p>
+    </div>
+  );
 }
 
 export function InvestmentSignal({ signal, compact = false }: { signal: Signal; compact?: boolean }) {
@@ -84,11 +115,21 @@ export function InvestmentCenter({ openPlan }: { openPlan: () => void }) {
         <button type="button" aria-pressed={history} onClick={() => setHistory(true)}>历史</button>
         <button type="button" aria-pressed="false" disabled={scan.isPending} onClick={() => scan.mutate()}>{scan.isPending ? "检查中…" : "检查价格"}</button>
       </div>
-      {scan.data ? <p role="status" className="text-xs text-[var(--dim)]">检查 {scan.data.checked} 个标的，新增 {scan.data.signals} 条，暂缓 {scan.data.deferred} 个{scan.data.unavailable.length ? ` · ${scan.data.unavailable.join("、")}` : ""}</p> : null}
+      {scan.data ? <p role="status" className="text-xs text-[var(--dim)]">检查 {scan.data.checked} 个标的，新增 {scan.data.signals} 条，暂缓 {scan.data.deferred} 个{scan.data.unavailable.length ? ` · ${scan.data.unavailable.join("、")}` : ""}{scan.data.unverifiedClose.length ? ` · 前收待核对 ${scan.data.unverifiedClose.join("、")}` : ""}</p> : null}
       {scan.error ? <p role="alert" className="text-sm text-[var(--up)]">{scan.error.message}</p> : null}
+      {!history && overview.data?.openRisks.length ? (
+        <div className="monitor-panel monitor-rows">
+          {overview.data.openRisks.map((risk) => (
+            <article className="px-4 py-3" key={risk.symbol}>
+              <p className="text-sm font-semibold"><span className="monitor-tag monitor-tag-risk">持续风险</span> {risk.symbol} · 风险线 ${risk.riskPrice.toFixed(2)} 美元</p>
+              <p className="mt-1 text-xs text-[var(--dim)]">最近确认 {times.format(risk.observedAt)}（北京时间）{risk.price != null ? ` · ${risk.price.toFixed(2)} 美元` : ""}</p>
+            </article>
+          ))}
+        </div>
+      ) : null}
       <div className="monitor-panel monitor-rows">
         {visible.length ? visible.map((signal) => <InvestmentSignal signal={signal} key={signal.id} />) :
-          <p className="px-4 py-4 text-sm text-[var(--dim)]">{overview.isPending ? "正在读取…" : "暂无投资信号。"}</p>}
+          <p className="px-4 py-4 text-sm text-[var(--dim)]">{overview.isPending ? "正在读取…" : !history && overview.data && monitorIssue(overview.data.health) ? "暂无已记录的投资信号，部分监测链路待核对。" : "暂无投资信号。"}</p>}
       </div>
       <details className="monitor-panel monitor-disclosure">
         <summary>QQ 邮件与监测状态</summary>
@@ -108,6 +149,7 @@ export function InvestmentCenter({ openPlan }: { openPlan: () => void }) {
             </div>
           ))}
           {confirm.error ? <p role="alert" className="text-sm text-[var(--up)]">{confirm.error.message}</p> : null}
+          {overview.data ? <HealthDetails health={overview.data.health} /> : null}
           <div className="border-t border-[var(--border)] pt-3">
             {overview.data?.runs.length ? overview.data.runs.map((run, index) => (
               <p className="mb-2 text-xs text-[var(--dim)]" key={`${run.at}:${index}`}>{times.format(run.at)} · {run.kind === "investment" ? "价格监测" : "官方事件"} · {run.detail}</p>

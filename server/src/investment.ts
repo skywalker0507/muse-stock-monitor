@@ -1,6 +1,8 @@
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
-import { and, asc, desc, eq, exists, gt, inArray, isNull, lt, lte } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, or } from "drizzle-orm";
 import * as schema from "./schema";
+import { compatiblePreviousClose, secureSourceUrl, validatedQuote } from "./market-evidence";
+import { heartbeatStatus, monitorHealth, monitorHealthView, saveHeartbeat } from "./investment-health";
 
 const minute = 60_000;
 const hour = 60 * minute;
@@ -84,16 +86,6 @@ const mailView = z.object({
   test: z.boolean(),
 });
 
-function escapedHttps(value: string | null | undefined) {
-  if (!value) return null;
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" && !url.username && !url.password && !url.port ? url : null;
-  } catch {
-    return null;
-  }
-}
-
 async function getTargets(db: Db) {
   const [plans, positions, watch] = await Promise.all([
     db.select().from(schema.investmentPlans).orderBy(asc(schema.investmentPlans.symbol)),
@@ -115,17 +107,6 @@ function activeTargets(targets: Awaited<ReturnType<typeof getTargets>>) {
   return targets.symbols.filter((symbol) => targets.lotsBySymbol.has(symbol) || targets.plansBySymbol.get(symbol)?.enabled);
 }
 
-const providerQuote = z.object({
-  resolved: z.object({ matched: z.string(), symbol: z.string().nullish() }),
-  instrument: z.object({
-    symbol: z.string(),
-    price: z.number().positive(),
-    currency: z.literal("USD"),
-    as_of: instant,
-    url: z.string().max(700).nullish(),
-  }),
-});
-
 function planReview(plan: Plan | undefined, held: boolean) {
   if (plan?.purpose === "long" || (held && !plan)) return "核对持仓和最新公告，复核原有持有理由是否变化。";
   if (plan?.purpose === "trade") return "在券商核对最新报价与可交易状态，再按你的退出纪律复核。";
@@ -137,11 +118,10 @@ function positionImpact(held: boolean) {
 }
 
 async function scanSymbol(ctx: Ctx, db: Db, feed: InvestmentFeed, symbol: string, plan: Plan | undefined, lots: Lot[]) {
-  const result = providerQuote.safeParse(await feed.quote(ctx, symbol));
-  if (!result.success || result.data.resolved.matched !== "exact") return "unavailable" as const;
-  const { resolved, instrument } = result.data;
-  if (instrument.symbol.toUpperCase() !== symbol || (resolved.symbol && resolved.symbol.toUpperCase() !== symbol)) return "unavailable" as const;
-  const observedAt = Date.parse(instrument.as_of);
+  const response = await feed.quote(ctx, symbol);
+  const instrument = validatedQuote(response, symbol, Date.now());
+  if (!instrument) return "unavailable" as const;
+  const { observedAt } = instrument;
   const now = Date.now();
   const observed = feed.sessionAt(new Date(observedAt));
   const current = feed.sessionAt(new Date(now));
@@ -152,7 +132,7 @@ async function scanSymbol(ctx: Ctx, db: Db, feed: InvestmentFeed, symbol: string
   if (!regular && !(plan?.includeExtended && extended)) return "session" as const;
 
   const [previous] = await db.select().from(schema.investmentQuoteState).where(eq(schema.investmentQuoteState.symbol, symbol)).limit(1);
-  if (previous && observedAt <= previous.observedAt) return 0;
+  if (previous && observedAt < previous.observedAt) return "stale" as const;
   const held = lots.length > 0;
   const price = instrument.price;
   const lotSignature = JSON.stringify(lots.map(({ id, shares, cost }) => [id, shares, cost]));
@@ -173,7 +153,7 @@ async function scanSymbol(ctx: Ctx, db: Db, feed: InvestmentFeed, symbol: string
     tradeDate: observed.date,
     impact: positionImpact(held),
     source: "Muse 行情通道",
-    sourceUrl: escapedHttps(instrument.url)?.href ?? null,
+    sourceUrl: secureSourceUrl(instrument.url)?.href ?? null,
     observedAt,
     detectedAt: now,
   };
@@ -186,8 +166,29 @@ async function scanSymbol(ctx: Ctx, db: Db, feed: InvestmentFeed, symbol: string
     });
   };
 
-  if (riskActive && !previous?.riskActive && plan?.riskPrice != null) {
-    makeSignal("risk_price", "urgent", `${symbol} ${quoteText}，触及风险复核价 $${plan.riskPrice.toFixed(2)}`, planReview(plan, held));
+  const events = schema.investmentSignals;
+  const mails = schema.investmentMail;
+  const episodeDay = (date: string) => Date.parse(`${date}T00:00:00Z`);
+  let riskStartedAt = riskActive ? previous?.riskStartedAt ?? episodeDay(observed.date) : null;
+  if (riskActive && plan?.riskPrice != null) {
+    const [latest] = previous?.riskActive ? await db.select({
+      id: events.id, observedAt: events.observedAt, expiresAt: events.expiresAt,
+      riskStartedAt: events.riskStartedAt, mailId: events.mailId, status: mails.status,
+    }).from(events).leftJoin(mails, eq(mails.id, events.mailId)).where(and(
+      eq(events.symbol, symbol), eq(events.kind, "risk_price"),
+      previous.riskStartedAt != null ? gte(events.observedAt, previous.riskStartedAt) : gte(events.detectedAt, plan.updatedAt),
+    )).orderBy(desc(events.id)).limit(1) : [];
+    riskStartedAt = latest ? latest.riskStartedAt ?? episodeDay(feed.sessionAt(new Date(latest.observedAt)).date) : riskStartedAt;
+    const undelivered = latest && (latest.mailId == null || latest.status === "expired" || latest.status === "not_sent");
+    const delayed = undelivered && latest.expiresAt <= now;
+    if (!latest || delayed) {
+      pending.push({
+        ...base, kind: "risk_price", priority: "urgent", riskStartedAt,
+        eventKey: delayed ? `risk_price:${symbol}:recheck:${latest.id}` : `risk_price:${symbol}:${observed.date}`,
+        title: `${symbol} ${delayed ? "延迟复核，仍低于" : "触及"}风险价 $${plan.riskPrice.toFixed(2)} · ${quoteText}`,
+        nextStep: planReview(plan, held), expiresAt: now + 3 * hour,
+      });
+    }
   }
   if (entryActive && !previous?.entryActive && plan?.entryLow != null && plan.entryHigh != null) {
     const pendingEvent = plan.nextEvent && (!plan.nextEventDate || plan.nextEventDate >= observed.date);
@@ -202,29 +203,42 @@ async function scanSymbol(ctx: Ctx, db: Db, feed: InvestmentFeed, symbol: string
       `常规交易观测峰值 $${peakPnl.toFixed(2)}，当前估算浮盈亏 $${pnl.toFixed(2)}。复核你的止盈纪律。`,
     );
   }
+  let unverifiedClose = false;
   if (held && regular && observed.minutesET < 630) {
     const [priorBar] = await db.select({ close: schema.dailyBars.close }).from(schema.dailyBars)
-      .where(and(eq(schema.dailyBars.symbol, symbol), eq(schema.dailyBars.date, observed.previousTradingDay))).limit(1);
+      .where(and(eq(schema.dailyBars.symbol, symbol), eq(schema.dailyBars.date, observed.previousTradingDay),
+        isNotNull(schema.dailyBars.verifiedAtMs))).limit(1);
     const threshold = plan?.openingDropPct ?? 8;
-    const drop = priorBar && priorBar.close > 0 ? (1 - price / priorBar.close) * 100 : null;
+    const comparable = compatiblePreviousClose(instrument, priorBar?.close ?? null);
+    unverifiedClose = !comparable;
+    const drop = comparable && priorBar ? (1 - price / priorBar.close) * 100 : null;
     if (drop != null && drop >= threshold && !riskActive) {
       makeSignal("opening_drop", "urgent", `${symbol} 开盘后一小时较前收下跌 ${drop.toFixed(1)}%`, `${quoteText}。原因待核实，先查公司公告、交易所和同行走势。`);
     }
   }
 
-  const state = { observedAt, lotSignature, peakPnl, entryActive, riskActive, givebackActive };
+  const state = { observedAt, price, riskStartedAt, lotSignature, peakPnl, entryActive, riskActive, givebackActive };
   const updateState = db.insert(schema.investmentQuoteState).values({ symbol, ...state }).onConflictDoUpdate({
-    target: schema.investmentQuoteState.symbol, set: state, setWhere: lt(schema.investmentQuoteState.observedAt, observedAt),
+    target: schema.investmentQuoteState.symbol, set: state, setWhere: lte(schema.investmentQuoteState.observedAt, observedAt),
   });
+  const endedRisk = previous?.riskActive && !riskActive;
+  const markEnded = db.update(events).set({ expiresAt: now }).where(and(
+    eq(events.symbol, symbol), eq(events.kind, "risk_price"), gt(events.expiresAt, now),
+    exists(db.select({ symbol: schema.investmentQuoteState.symbol }).from(schema.investmentQuoteState).where(and(
+      eq(schema.investmentQuoteState.symbol, symbol), eq(schema.investmentQuoteState.observedAt, observedAt),
+      eq(schema.investmentQuoteState.riskActive, false),
+    ))),
+  ));
   if (pending.length === 0) {
-    await updateState;
-    return 0;
+    if (endedRisk) await db.batch([updateState, markEnded]);
+    else await updateState;
+    return { signals: 0, unverifiedClose };
   }
   const [inserted] = await db.batch([
-    db.insert(schema.investmentSignals).values(pending).onConflictDoNothing().returning({ id: schema.investmentSignals.id }),
-    updateState,
+    db.insert(events).values(pending).onConflictDoNothing().returning({ id: events.id }),
+    updateState, ...(endedRisk ? [markEnded] : []),
   ]);
-  return inserted.length;
+  return { signals: inserted.length, unverifiedClose };
 }
 
 const externalEvent = z.object({
@@ -238,7 +252,7 @@ const externalEvent = z.object({
 });
 
 function officialEvent(event: z.output<typeof externalEvent>) {
-  const url = escapedHttps(event.sourceUrl);
+  const url = secureSourceUrl(event.sourceUrl);
   if (!url) return null;
   if (event.type === "halt" && ["nasdaqtrader.com", "www.nasdaqtrader.com"].includes(url.hostname) &&
       /^\/(?:rss|trader)\.aspx$/i.test(url.pathname)) return url.href;
@@ -277,8 +291,23 @@ function mailText(mail: Mail, signals: (typeof schema.investmentSignals.$inferSe
   };
 }
 
-async function signalsForMail(db: Db, id: string) {
-  return db.select().from(schema.investmentSignals).where(eq(schema.investmentSignals.mailId, id)).orderBy(desc(schema.investmentSignals.detectedAt));
+function currentRiskOrOtherSignal(db: Db) {
+  const signals = schema.investmentSignals;
+  const state = schema.investmentQuoteState;
+  const plans = schema.investmentPlans;
+  return or(ne(signals.kind, "risk_price"), exists(
+    db.select({ symbol: state.symbol }).from(state).innerJoin(plans, eq(plans.symbol, state.symbol))
+      .where(and(eq(state.symbol, signals.symbol), eq(state.riskActive, true), eq(plans.enabled, true), isNotNull(plans.riskPrice),
+        or(isNull(state.price), lte(state.price, plans.riskPrice)),
+        or(isNull(signals.riskStartedAt), eq(state.riskStartedAt, signals.riskStartedAt)))),
+  ));
+}
+
+async function signalsForMail(db: Db, id: string, now: number) {
+  const signals = schema.investmentSignals;
+  return db.select().from(signals)
+    .where(and(eq(signals.mailId, id), gt(signals.expiresAt, now), currentRiskOrOtherSignal(db)))
+    .orderBy(desc(signals.detectedAt));
 }
 
 async function claimMail(db: Db, mode: Mail["mode"], digestDay: string, now: number) {
@@ -290,7 +319,7 @@ async function claimMail(db: Db, mode: Mail["mode"], digestDay: string, now: num
     eq(mails.mode, mode), eq(mails.status, "not_sent"), isNull(mails.confirmedAt), lt(mails.attempts, 3), lte(mails.retryAfter, now),
   )).orderBy(asc(mails.capturedAt)).limit(1);
   if (retry) {
-    const events = (await signalsForMail(db, retry.id)).filter((event) => event.expiresAt > now);
+    const events = await signalsForMail(db, retry.id, now);
     const expired = events.length === 0;
     const leaseUntil = Math.min(leaseLimit, ...events.map((event) => event.expiresAt));
     const [claimed] = await db.update(mails).set({
@@ -307,6 +336,7 @@ async function claimMail(db: Db, mode: Mail["mode"], digestDay: string, now: num
     if (already) return null;
   }
   const unclaimed = and(eq(signals.priority, mode), isNull(signals.mailId), gt(signals.expiresAt, now),
+    currentRiskOrOtherSignal(db),
     mode === "digest" ? lte(signals.tradeDate, digestDay) : undefined);
   const candidates = await db.select({ id: signals.id, expiresAt: signals.expiresAt }).from(signals).where(unclaimed)
     .orderBy(asc(signals.detectedAt), asc(signals.id)).limit(mode === "urgent" ? 1 : 12);
@@ -356,13 +386,23 @@ export function createInvestmentActions(feed: InvestmentFeed) {
         const db = ownerDb(ctx);
         const { symbols } = await getTargets(db);
         if (!symbols.includes(input.symbol)) throw new Error("请先添加自选或录入持仓。");
+        const [previous] = await db.select().from(schema.investmentPlans).where(eq(schema.investmentPlans.symbol, input.symbol)).limit(1);
         const saved = { ...input, updatedAt: Date.now() };
         const { symbol, ...changes } = saved;
-        await db.batch([
-          db.insert(schema.investmentPlans).values(saved).onConflictDoUpdate({ target: schema.investmentPlans.symbol, set: changes }),
-          db.update(schema.investmentQuoteState).set({ entryActive: false, riskActive: false, givebackActive: false })
-            .where(eq(schema.investmentQuoteState.symbol, symbol)),
-        ]);
+        const riskChanged = !previous || previous.enabled !== input.enabled || previous.riskPrice !== input.riskPrice;
+        const ops = db.insert(schema.investmentPlans).values(saved).onConflictDoUpdate({ target: schema.investmentPlans.symbol, set: changes });
+        if (riskChanged) {
+          const events = schema.investmentSignals;
+          await db.batch([
+            ops,
+            db.update(schema.investmentQuoteState).set({ entryActive: false, riskActive: false, riskStartedAt: null, givebackActive: false })
+              .where(eq(schema.investmentQuoteState.symbol, symbol)),
+            db.update(events).set({ expiresAt: saved.updatedAt }).where(and(eq(events.symbol, symbol),
+              eq(events.kind, "risk_price"), isNull(events.mailId), gt(events.expiresAt, saved.updatedAt))),
+          ]);
+        } else {
+          await ops;
+        }
         ctx.invalidateQueries();
         return { ok: true as const };
       },
@@ -370,16 +410,22 @@ export function createInvestmentActions(feed: InvestmentFeed) {
 
     scanInvestmentPrices: defineAction({
       description: "采集持仓和已启用计划的报价，检查观察区、风险复核价、开盘急跌和浮盈回吐。",
-      request: z.object({}),
-      response: z.object({ checked: z.number(), signals: z.number(), deferred: z.number(), unavailable: z.array(z.string()) }),
-      async handler(ctx) {
+      request: z.object({ worker: z.boolean().default(false) }),
+      response: z.object({
+        checked: z.number(), signals: z.number(), deferred: z.number(), unavailable: z.array(z.string()), unverifiedClose: z.array(z.string()),
+      }),
+      async handler(ctx, { worker }) {
         const db = ownerDb(ctx);
         const startedAt = new Date();
         const session = feed.sessionAt(startedAt);
         const data = await getTargets(db);
         const symbols = activeTargets(data);
-        const report = { checked: 0, signals: 0, deferred: 0, unavailable: [] as string[] };
+        const report = { checked: 0, signals: 0, deferred: 0, unavailable: [] as string[], unverifiedClose: [] as string[] };
         if (symbols.length === 0 || !["open", "premarket", "afterhours"].includes(session.phase)) {
+          if (worker) {
+            await saveHeartbeat(db, "price", "skipped", symbols.length === 0 ? "暂无监测标的" : "当前休市");
+            ctx.invalidateQueries();
+          }
           return { ...report, deferred: symbols.length };
         }
         const eligible = symbols.filter((symbol) => {
@@ -387,7 +433,13 @@ export function createInvestmentActions(feed: InvestmentFeed) {
           return session.phase === "open" || (plan?.enabled && plan.includeExtended);
         });
         report.deferred = symbols.length - eligible.length;
-        if (eligible.length === 0) return report;
+        if (eligible.length === 0) {
+          if (worker) {
+            await saveHeartbeat(db, "price", "skipped", "无计划启用当前时段");
+            ctx.invalidateQueries();
+          }
+          return report;
+        }
         for (let offset = 0; offset < eligible.length; offset += 4) {
           const batch = eligible.slice(offset, offset + 4);
           const results = await Promise.allSettled(batch.map((symbol) => {
@@ -395,9 +447,11 @@ export function createInvestmentActions(feed: InvestmentFeed) {
             return scanSymbol(ctx, db, feed, symbol, plan?.enabled ? plan : undefined, data.lotsBySymbol.get(symbol) ?? []);
           }));
           results.forEach((result, index) => {
-            if (result.status === "fulfilled" && typeof result.value === "number") {
+            if (result.status === "fulfilled" && typeof result.value === "object") {
               report.checked++;
-              report.signals += result.value;
+              report.signals += result.value.signals;
+              const symbol = batch[index];
+              if (symbol && result.value.unverifiedClose) report.unverifiedClose.push(symbol);
             } else if (result.status === "fulfilled" && result.value === "session") {
               report.deferred++;
             } else {
@@ -406,12 +460,15 @@ export function createInvestmentActions(feed: InvestmentFeed) {
           });
         }
         const finishedAt = new Date();
+        const detail = `已检查 ${report.checked} 个标的，新增 ${report.signals} 个投资信号`
+          + (report.unavailable.length ? `；${report.unavailable.join("、")}` : "")
+          + (report.unverifiedClose.length ? `；前收待核对 ${report.unverifiedClose.join("、")}` : "");
+        const status = report.unavailable.length === 0 && report.unverifiedClose.length === 0 ?
+          "ok" : report.checked === 0 ? "error" : "partial";
         await db.insert(schema.refreshRuns).values({
-          kind: "investment",
-          status: report.unavailable.length === 0 ? "ok" : report.checked === 0 ? "error" : "partial",
-          startedAt, finishedAt, durationMs: finishedAt.getTime() - startedAt.getTime(),
-          detail: `已检查 ${report.checked} 个标的，新增 ${report.signals} 个投资信号${report.unavailable.length ? `；${report.unavailable.join("、")}` : ""}`,
+          kind: "investment", status, startedAt, finishedAt, durationMs: finishedAt.getTime() - startedAt.getTime(), detail,
         });
+        if (worker) await saveHeartbeat(db, "price", status, detail, finishedAt.getTime());
         ctx.invalidateQueries();
         return report;
       },
@@ -459,19 +516,34 @@ export function createInvestmentActions(feed: InvestmentFeed) {
           });
         }
         let added = 0;
-        for (let offset = 0; offset < rows.length; offset += 10) {
-          const inserted = await db.insert(schema.investmentSignals).values(rows.slice(offset, offset + 10))
+        // D1 has 100 bound parameters per statement. An official event currently binds 13.
+        const rowsPerInsert = 7;
+        for (let offset = 0; offset < rows.length; offset += rowsPerInsert) {
+          const inserted = await db.insert(schema.investmentSignals).values(rows.slice(offset, offset + rowsPerInsert))
             .onConflictDoNothing().returning({ id: schema.investmentSignals.id });
           added += inserted.length;
         }
         const finishedAt = new Date();
+        const status = sourceErrors.length === 0 ? "ok" : rows.length ? "partial" : "error";
+        const detail = `${source === "halt" ? "Nasdaq 暂停交易" : source === "sec" ? "SEC 8-K" : "官方事件"}新增 ${added} 条`
+          + (sourceErrors.length ? `；${sourceErrors.join("；")}` : "");
         await db.insert(schema.refreshRuns).values({
-          kind: "investment_events", status: sourceErrors.length === 0 ? "ok" : rows.length ? "partial" : "error",
-          startedAt: finishedAt, finishedAt, durationMs: 0,
-          detail: `${source === "halt" ? "Nasdaq 暂停交易" : source === "sec" ? "SEC 8-K" : "官方事件"}新增 ${added} 条${sourceErrors.length ? `；${sourceErrors.join("；")}` : ""}`,
+          kind: "investment_events", status, startedAt: finishedAt, finishedAt, durationMs: 0, detail,
         });
+        if (source !== "all") await saveHeartbeat(db, source, status, detail, finishedAt.getTime());
         ctx.invalidateQueries();
         return { added, ignored: events.length - added };
+      },
+    }),
+
+    recordInvestmentMailHeartbeat: defineAction({
+      description: "邮件任务处理完一轮后回写健康状态。空队列也回写；发件结果待核对时填写 partial 或 error。",
+      request: z.object({ status: heartbeatStatus, detail: z.string().trim().max(180).default("") }),
+      response: z.object({ ok: z.literal(true) }),
+      async handler(ctx, { status, detail }) {
+        await saveHeartbeat(ownerDb(ctx), "mail", status, detail);
+        ctx.invalidateQueries();
+        return { ok: true as const };
       },
     }),
 
@@ -483,20 +555,36 @@ export function createInvestmentActions(feed: InvestmentFeed) {
         mail: z.array(mailView),
         pendingUrgent: z.number(),
         pendingDigest: z.number(),
+        openRisks: z.array(z.object({ symbol: z.string(), price: z.number().nullable(), riskPrice: z.number(), observedAt: z.number() })),
+        health: monitorHealthView,
         runs: z.array(z.object({ kind: z.string(), status: z.string(), detail: z.string(), at: z.number() })),
       }),
       async handler(ctx) {
         const db = ownerDb(ctx);
         const now = Date.now();
-        const [signals, mail, pending, runs, testRows] = await Promise.all([
+        const session = feed.sessionAt(new Date(now));
+        const targets = await getTargets(db);
+        const live = activeTargets(targets).length > 0;
+        const extended = targets.plans.some((plan) => plan.enabled && plan.includeExtended);
+        const expectWorkers = live && ["open", "premarket", "afterhours"].includes(session.phase);
+        const expectPrice = expectWorkers && (session.phase === "open" || extended);
+        const [signals, mail, pending, runs, testRows, openRisks, health] = await Promise.all([
           db.select().from(schema.investmentSignals).orderBy(desc(schema.investmentSignals.detectedAt), desc(schema.investmentSignals.id)).limit(40),
           db.select().from(schema.investmentMail).orderBy(desc(schema.investmentMail.capturedAt)).limit(20),
           db.select({ priority: schema.investmentSignals.priority }).from(schema.investmentSignals)
-            .where(and(isNull(schema.investmentSignals.mailId), gt(schema.investmentSignals.expiresAt, now))),
+            .where(and(isNull(schema.investmentSignals.mailId), gt(schema.investmentSignals.expiresAt, now), currentRiskOrOtherSignal(db))),
           db.select().from(schema.refreshRuns).where(inArray(schema.refreshRuns.kind, ["investment", "investment_events"]))
             .orderBy(desc(schema.refreshRuns.id)).limit(5),
           db.select({ mailId: schema.investmentSignals.mailId }).from(schema.investmentSignals)
             .where(eq(schema.investmentSignals.kind, "test")).orderBy(desc(schema.investmentSignals.id)).limit(40),
+          db.select({
+            symbol: schema.investmentQuoteState.symbol, price: schema.investmentQuoteState.price,
+            riskPrice: schema.investmentPlans.riskPrice, observedAt: schema.investmentQuoteState.observedAt,
+          }).from(schema.investmentQuoteState)
+            .innerJoin(schema.investmentPlans, eq(schema.investmentPlans.symbol, schema.investmentQuoteState.symbol))
+            .where(and(eq(schema.investmentQuoteState.riskActive, true), eq(schema.investmentPlans.enabled, true),
+              isNotNull(schema.investmentPlans.riskPrice))).orderBy(desc(schema.investmentQuoteState.observedAt)).limit(50),
+          monitorHealth(db, now, expectPrice, expectWorkers),
         ]);
         const testIds = new Set(testRows.map((row) => row.mailId));
         return {
@@ -504,6 +592,8 @@ export function createInvestmentActions(feed: InvestmentFeed) {
           mail: mail.map((entry) => ({ ...entry, status: deliveryStatus(entry, now), test: testIds.has(entry.id) })),
           pendingUrgent: pending.filter((signal) => signal.priority === "urgent").length,
           pendingDigest: pending.filter((signal) => signal.priority === "digest").length,
+          openRisks: openRisks.flatMap((risk) => risk.riskPrice == null ? [] : [{ ...risk, riskPrice: risk.riskPrice }]),
+          health,
           runs: runs.map(({ kind, status, detail, finishedAt }) => ({ kind, status, detail, at: finishedAt.getTime() })),
         };
       },

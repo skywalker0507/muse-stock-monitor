@@ -11,7 +11,7 @@ XAxis,
 YAxis,
 } from "recharts";
 import { api, type ApiResponse } from "./api";
-import { InvestmentCenter, InvestmentPlanEditor, InvestmentSignal, useInvestmentOverview } from "./investment";
+import { InvestmentCenter, InvestmentPlanEditor, InvestmentSignal, monitorIssue, useInvestmentOverview } from "./investment";
 import type { Actions } from "../../server/src/actions";
 
 const FIELDS = actionFields<typeof Actions>();
@@ -262,6 +262,8 @@ function Overview({ data, openStock, openAlerts, openEvents, openSystem, openInv
 }) {
   const calendar = data.calendar;
   const investment = useInvestmentOverview();
+  const coverageIssue = investment.isError ? "无法核对后台运行状态" : investment.data ? monitorIssue(investment.data.health) : "";
+  const openRiskCount = investment.data?.openRisks.length ?? 0;
   const investmentSignals = investment.data?.signals.filter((signal) => signal.priority === "urgent" && signal.expiresAt > Date.now()).slice(0, 3) ?? [];
   const holdings = new Set(data.positions.map((position) => position.symbol));
   const core = new Set(data.stocks.filter((stock) => stock.grp === "core").map((stock) => stock.symbol));
@@ -290,6 +292,12 @@ function Overview({ data, openStock, openAlerts, openEvents, openSystem, openInv
         {calendar.earlyClose ? <span>提前收盘 · 北京时间次日 {earlyCloseTime}</span> : null}
         {coreIssues.size > 0 ? <button type="button" className="monitor-link" onClick={openSystem}>核心或持仓报价待核对 {coreIssues.size} 项</button> : null}
       </div>
+      {coverageIssue || openRiskCount > 0 ? (
+        <button type="button" onClick={openInvesting} className="monitor-panel px-4 py-3 text-left text-sm">
+          {openRiskCount > 0 ? <p className="font-semibold text-[var(--up)]">持续风险 {openRiskCount} 项 · 查看待复核</p> : null}
+          {coverageIssue ? <p className={openRiskCount ? "mt-1 text-xs text-[var(--dim)]" : "font-medium"}>监测待核对 · {coverageIssue}</p> : null}
+        </button>
+      ) : null}
       <section>
         <Heading title="今日关注">
           <div className="flex gap-1">
@@ -297,7 +305,7 @@ function Overview({ data, openStock, openAlerts, openEvents, openSystem, openInv
             <button type="button" className="monitor-link" onClick={openInvesting}>投资信号</button>
           </div>
         </Heading>
-        {investmentSignals.length === 0 && alerts.length === 0 && events.length === 0 ? <Empty>暂无新触发。</Empty> : (
+        {investmentSignals.length === 0 && alerts.length === 0 && events.length === 0 ? <Empty>{coverageIssue ? "暂无已记录的触发，监测覆盖待核对。" : investment.isPending ? "正在核对监测状态…" : "暂无新触发。"}</Empty> : (
           <Panel className="monitor-rows">
             {investmentSignals.map((signal) => <InvestmentSignal signal={signal} key={signal.id} compact />)}
             {alerts.map((alert) => (
@@ -1034,6 +1042,9 @@ export function App() {
 
       <main className="monitor-width monitor-content">
         {refresh.error || refresh.data?.failed.length ? <p role="alert" className="text-sm text-[var(--up)]">{refresh.error?.message ?? `行情获取失败 · ${refresh.data?.failed.join("、")}`}</p> : null}
+        {!refresh.data?.failed.length && refresh.data?.warnings.length ? (
+          <p className="text-xs text-[var(--dim)]">日线或前收待核对 · {refresh.data.warnings.join("、")}</p>
+        ) : null}
         {dash.isPending ? <Empty>正在加载监控数据…</Empty> : dash.isError && !data ? (
           <Empty><button type="button" className="monitor-link" onClick={() => dash.refetch()}>数据加载失败，重试</button></Empty>
         ) : data ? (
