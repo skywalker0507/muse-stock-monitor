@@ -2,7 +2,7 @@
 // 行情：ctx.tool.finance_ticker（个股/ETF 结构化报价 + 日线历史，唯一价格来源）
 // 52 周高/低与回撤/均线/RSI：由本标的自身近 252 个交易日日K（OHLC）在服务端
 //   确定性计算，不采用行情源的 week_52 字段（实测 GOOG 会串入 GOOGL 数值），
-//   也不使用模型估算。指数（标普500/纳指100）与 VIX/10Y/DXY/恐惧贪婪：
+//   也不使用模型估算。指数（标普500/纳指100）与 VIX/10Y：
 //   finance_ticker 只能解析到 OANDA 差价合约（数值与真实指数不符），改走
 //   定向网页搜索 + 提炼，并强制标注来源与 asOf；取不到一律 null 显示不可用。
 // 预警：状态机（alert_state）——只有实际跨越阈值才触发，同日同指标只保留
@@ -11,7 +11,7 @@
 //   降级为确定性事实汇总并写明失败原因，绝不静默为空。
 
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
-import { asc, desc, eq, gte, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray } from "drizzle-orm";
 import * as schema from "./schema";
 
 type Db = ReturnType<Ctx["db"]>;
@@ -34,7 +34,13 @@ const DEFAULT_WATCHLIST: { symbol: string; grp: "core" | "opportunity" }[] = [
   { symbol: "MU", grp: "opportunity" },
 ];
 
-const MARKET_KEYS = ["SPX", "NAS100", "VIX", "TNX10Y", "DXY", "FEAR_GREED"] as const;
+const MARKET_LABELS = {
+  SPX: "标普500指数",
+  NAS100: "纳斯达克100指数",
+  VIX: "VIX 恐慌指数",
+  TNX10Y: "美国10年期国债收益率",
+};
+const MARKET_KEYS = Object.keys(MARKET_LABELS) as (keyof typeof MARKET_LABELS)[];
 
 function etDate(d = new Date()): string {
   return new Intl.DateTimeFormat("en-CA", {
@@ -42,13 +48,6 @@ function etDate(d = new Date()): string {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).format(d);
-}
-
-function etWeekday(d = new Date()): string {
-  return new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York",
-    weekday: "short",
   }).format(d);
 }
 
@@ -98,11 +97,9 @@ const NYSE_HOLIDAYS: Record<string, string> = {
 
 // 提前收盘（13:00 ET）
 const NYSE_EARLY_CLOSE: Record<string, string> = {
-  "2026-07-02": "独立日前夕",
   "2026-11-27": "感恩节次日",
   "2026-12-24": "圣诞前夕",
   "2027-11-26": "感恩节次日",
-  "2027-12-23": "圣诞前夕",
 };
 
 function nthSunday(year: number, month: number, n: number): number {
@@ -186,6 +183,7 @@ type MarketStatus = {
   dstLabel: string;
   beijingSession: string;
   lastTradingDay: string;
+  lastClosedTradingDay: string;
   nextTradingDay: string;
 };
 
@@ -230,6 +228,7 @@ function marketStatusNow(now = new Date()): MarketStatus {
       ? "北京时间 21:30 – 次日 04:00"
       : "北京时间 22:30 – 次日 05:00",
     lastTradingDay: lastTd,
+    lastClosedTradingDay: trading && minutes >= closeMin ? today : prevTradingDay(today),
     nextTradingDay: trading && minutes < 9 * 60 + 30 ? today : nextTradingDay(today),
   };
 }
@@ -297,30 +296,25 @@ async function webSearch(ctx: Ctx, query: string): Promise<SearchResult[]> {
 // ---------- 初始化（用户给定的标的清单与默认规则，仅在为空时写入一次） ----------
 
 async function ensureSeeded(db: Db) {
-  const existing = await db.select({ id: schema.watchlist.id }).from(schema.watchlist).limit(1);
-  if (existing.length === 0) {
-    await db.insert(schema.watchlist).values(
-      DEFAULT_WATCHLIST.map((w) => ({ symbol: w.symbol, grp: w.grp, name: "" })),
-    );
+  const [existingRules] = await db.select({ id: schema.rules.id }).from(schema.rules).limit(1);
+  if (!existingRules) {
+    const [existingSymbol] = await db.select({ id: schema.watchlist.id }).from(schema.watchlist).limit(1);
+    if (!existingSymbol) {
+      await db.insert(schema.watchlist).values(
+        DEFAULT_WATCHLIST.map((w) => ({ symbol: w.symbol, grp: w.grp, name: "" })),
+      ).onConflictDoNothing();
+    }
+    await db.insert(schema.rules).values({ id: 1 }).onConflictDoNothing();
   }
-  const r = await db.select().from(schema.rules).limit(1);
-  if (r.length === 0) {
-    await db.insert(schema.rules).values({ id: 1 });
-  }
-  const mi = await db.select({ key: schema.marketIndicators.key }).from(schema.marketIndicators).limit(1);
-  if (mi.length === 0) {
-    await db.insert(schema.marketIndicators).values([
-      { key: "SPX", label: "标普500指数", source: "" },
-      { key: "NAS100", label: "纳斯达克100指数", source: "" },
-      { key: "VIX", label: "VIX 恐慌指数", source: "" },
-      { key: "TNX10Y", label: "美国10年期国债收益率", source: "" },
-      { key: "DXY", label: "美元指数 DXY", source: "" },
-      { key: "FEAR_GREED", label: "CNN 恐惧与贪婪指数", source: "" },
-    ]);
+  const [existingMarket] = await db.select({ key: schema.marketIndicators.key }).from(schema.marketIndicators).limit(1);
+  if (!existingMarket) {
+    await db.insert(schema.marketIndicators).values(
+      MARKET_KEYS.map((key) => ({ key, label: MARKET_LABELS[key], source: "" })),
+    ).onConflictDoNothing();
   }
 }
 
-async function logRun(db: Db, kind: string, status: "ok" | "error", detail: string, started: Date) {
+async function logRun(db: Db, kind: string, status: (typeof schema.refreshRuns.$inferSelect)["status"], detail: string, started: Date) {
   const finished = new Date();
   await db.insert(schema.refreshRuns).values({
     kind,
@@ -402,6 +396,7 @@ async function evalCrossing(
   value: number | null,
   level: number,
   cooldownMs: number,
+  priorLevel?: (value: number) => number,
 ): Promise<{ crossed: boolean; prevValue: number | null }> {
   const rows = await db.select().from(schema.alertState).where(eq(schema.alertState.key, key)).limit(1);
   const st = rows[0];
@@ -418,23 +413,18 @@ async function evalCrossing(
     return { crossed: false, prevValue: null };
   }
   let crossed = false;
-  let firedLevel = st.firedLevel;
   let lastFiredAt = st.lastFiredAt;
-  if (level > st.firedLevel) {
+  const lastLevel = priorLevel && st.prevValue != null ? priorLevel(st.prevValue) : st.firedLevel;
+  if (level > lastLevel) {
     const cooled = !st.lastFiredAt || now.getTime() - st.lastFiredAt.getTime() >= cooldownMs;
     if (cooled) {
       crossed = true;
       lastFiredAt = now;
     }
-    // 无论是否处于冷却期，跨越事实都记入状态，避免冷却结束后无跨越地补发
-    firedLevel = level;
-  } else if (level < st.firedLevel) {
-    // 等级回落（含恢复到 0）：更新已触发等级，允许之后再次跨越触发
-    firedLevel = level;
   }
   await db
     .update(schema.alertState)
-    .set({ prevValue: value, firedLevel, lastFiredAt, updatedAt: now })
+    .set({ prevValue: value, firedLevel: level, lastFiredAt, updatedAt: now })
     .where(eq(schema.alertState.key, key));
   return { crossed, prevValue: st.prevValue };
 }
@@ -458,9 +448,9 @@ async function insertAlertMaxLevel(
     .select({ id: schema.alerts.id, dedupKey: schema.alerts.dedupKey })
     .from(schema.alerts)
     .where(eq(schema.alerts.kind, opts.kind));
-  const stale = sameDay
-    .filter((a) => opts.match(a.dedupKey) && opts.rankOf(a.dedupKey) < opts.rank)
-    .map((a) => a.id);
+  const related = sameDay.filter((a) => opts.match(a.dedupKey));
+  if (related.some((a) => opts.rankOf(a.dedupKey) >= opts.rank)) return false;
+  const stale = related.map((a) => a.id);
   if (stale.length > 0) {
     await db.delete(schema.alerts).where(inArray(schema.alerts.id, stale));
   }
@@ -670,6 +660,9 @@ async function refreshMarketInternal(ctx: Ctx, force: boolean) {
   }
 
   const watch = await db.select().from(schema.watchlist).orderBy(asc(schema.watchlist.id));
+  const positions = await db.select().from(schema.positions);
+  const watchedSymbols = new Set(watch.map((row) => row.symbol));
+  const symbols = [...new Set([...watchedSymbols, ...positions.map((row) => row.symbol)])];
   const rulesRows = await db.select().from(schema.rules).limit(1);
   const rules = rulesRows[0] ?? { movePct: 5, indexDropPct: 2, vixLevels: "20,25,30,40", ddWatchPct: 10 };
   const today = etDate();
@@ -679,26 +672,26 @@ async function refreshMarketInternal(ctx: Ctx, force: boolean) {
   let newAlerts = 0;
 
   const results = await Promise.all(
-    watch.map(async (w) => {
+    symbols.map(async (symbol) => {
       try {
-        const r = await refreshSymbol(ctx, db, w.symbol);
+        const r = await refreshSymbol(ctx, db, symbol);
         if (!r.ok) {
-          failed.push(w.symbol);
-          if (r.error) failReasons.push(`${w.symbol}：${r.error}`);
+          failed.push(symbol);
+          if (r.error) failReasons.push(`${symbol}：${r.error}`);
         }
-        return { symbol: w.symbol, ...r };
+        return { symbol, ...r };
       } catch (e) {
-        failed.push(w.symbol);
-        failReasons.push(`${w.symbol}：${e instanceof Error ? e.message.slice(0, 80) : "未知错误"}`);
-        return { symbol: w.symbol, ok: false, price: null, changePct: null, dd52: null, tier: 0 };
+        failed.push(symbol);
+        failReasons.push(`${symbol}：${e instanceof Error ? e.message.slice(0, 80) : "未知错误"}`);
+        return { symbol, ok: false, price: null, changePct: null, dd52: null, tier: 0 };
       }
     }),
   );
   updated = results.filter((r) => r.ok).length;
 
-  // 规则评估（状态机：只有实际跨越阈值才触发，同日同指标只留最高等级一条）
+  const drawdownLevel = (value: number) => value >= rules.ddWatchPct ? Math.max(1, ddTier(value)) : 0;
   for (const r of results) {
-    if (!r.ok) continue;
+    if (!r.ok || !watchedSymbols.has(r.symbol)) continue;
     // 个股异动：等级 1 = 达到阈值，2 = 达到阈值的 1.6 倍（严重）
     if (r.changePct != null) {
       const mag = Math.abs(r.changePct);
@@ -719,19 +712,20 @@ async function refreshMarketInternal(ctx: Ctx, force: boolean) {
         if (inserted) newAlerts++;
       }
     }
-    // 回撤等级：等级即回撤分级 tier（0–5），跨越到更高一级才触发，24 小时冷却
+    // 回撤先检查用户阈值，再判断后续分级升级，冷却 24 小时
     if (r.dd52 != null) {
-      const ev = await evalCrossing(db, `dd:${r.symbol}`, r.dd52, r.tier, COOLDOWN_MS.slow);
-      if (ev.crossed && r.tier > 0 && r.dd52 >= rules.ddWatchPct) {
+      const rank = drawdownLevel(r.dd52);
+      const ev = await evalCrossing(db, `dd:${r.symbol}`, r.dd52, rank, COOLDOWN_MS.slow, drawdownLevel);
+      if (ev.crossed && rank > 0) {
         const inserted = await insertAlertMaxLevel(db, {
-          dedupKey: `dd:${r.symbol}:${today}:${r.tier}`,
+          dedupKey: `dd:${r.symbol}:${today}:${rank}`,
           symbol: r.symbol,
           kind: "drawdown",
           level: r.tier >= 4 ? "critical" : r.tier >= 3 ? "warn" : "info",
           title: `${r.symbol} 距52周高点回撤 ${r.dd52.toFixed(1)}%`,
-          detail: `回撤等级升至：${TIER_LABELS[r.tier] ?? ""}（此前 ${ev.prevValue != null ? `${ev.prevValue.toFixed(1)}%` : "—"}）。回撤不等于买入机会，需区分下跌原因后再研究。`,
+          detail: `达到回撤关注阈值 ${rules.ddWatchPct}%${r.tier > 0 ? ` · ${TIER_LABELS[r.tier]}` : ""}（此前 ${ev.prevValue != null ? `${ev.prevValue.toFixed(1)}%` : "—"}）。回撤不等于买入机会，需区分下跌原因后再研究。`,
           match: (k) => k.startsWith(`dd:${r.symbol}:${today}:`),
-          rank: r.tier,
+          rank,
           rankOf: (k) => Number(k.split(":").pop() ?? 0) || 0,
         });
         if (inserted) newAlerts++;
@@ -740,10 +734,11 @@ async function refreshMarketInternal(ctx: Ctx, force: boolean) {
   }
 
   // 持仓：更新期间最高价 + 从高点回撤预警（跨越触发，24 小时冷却）
-  const posRows = await db.select().from(schema.positions);
+  const refreshedSymbols = new Set(results.filter((row) => row.ok).map((row) => row.symbol));
   const quoteRows = await db.select().from(schema.quotes);
   const quoteMap = new Map(quoteRows.map((q) => [q.symbol, q]));
-  for (const p of posRows) {
+  for (const p of positions) {
+    if (!refreshedSymbols.has(p.symbol)) continue;
     const q = quoteMap.get(p.symbol);
     if (!q || q.price == null) continue;
     const newPeak = Math.max(p.peakPrice ?? 0, q.price, q.dayHigh ?? 0);
@@ -773,12 +768,12 @@ async function refreshMarketInternal(ctx: Ctx, force: boolean) {
     }
   }
 
-  const status = failed.length >= watch.length && watch.length > 0 ? "error" : "ok";
+  const status = failed.length === 0 ? "ok" : updated === 0 ? "error" : "partial";
   await logRun(
     db,
     "market",
     status,
-    `更新 ${updated}/${watch.length} 个标的${failed.length ? `；失败：${failReasons.join("；") || failed.join(",")}` : ""}；新增预警 ${newAlerts} 条`,
+    `更新 ${updated}/${symbols.length} 个标的${failed.length ? `；失败：${failReasons.join("；") || failed.join(",")}` : ""}；新增预警 ${newAlerts} 条`,
     started,
   );
   ctx.invalidateQueries();
@@ -845,12 +840,6 @@ const indicatorDistillSchema = z.object({
   nas100: z.object({ value: z.number().nullable(), change_pct: z.number().nullable(), as_of: z.string().nullable() }),
   vix: z.object({ value: z.number().nullable(), as_of: z.string().nullable() }),
   tnx10y: z.object({ value: z.number().nullable(), as_of: z.string().nullable() }),
-  dxy: z.object({ value: z.number().nullable(), as_of: z.string().nullable() }),
-  fear_greed: z.object({
-    value: z.number().nullable(),
-    label: z.string().nullable(),
-    as_of: z.string().nullable(),
-  }),
 });
 
 async function refreshNewsInternal(ctx: Ctx) {
@@ -878,13 +867,12 @@ async function refreshNewsInternal(ctx: Ctx) {
   // 先并行完成全部搜索（快），再并行提炼，避免串行耗尽 action 时限。
   // 财报改为逐标的定向搜索（实测组合查询命不中具体日期，逐个搜 Zacks/
   // TipRanks 等日历页可得明确日期），每条结果带 symbol_hint 供提炼对齐。
-  const [newsSearch, spxSearch, vixSearch, yieldSearch, dxySearch, fgSearch, earnSearches] = await Promise.all([
+  const [newsSearch, spxSearch, nasdaqSearch, vixSearch, yieldSearch, earnSearches] = await Promise.all([
     webSearch(ctx, `US stock market news today ${symbols.slice(0, 7).join(" ")}`),
-    webSearch(ctx, "S&P 500 index closing value today Nasdaq 100 index close"),
+    webSearch(ctx, "S&P 500 index closing value latest trading session SPX"),
+    webSearch(ctx, "Nasdaq 100 index closing value latest trading session NDX"),
     webSearch(ctx, "VIX index today closing level"),
     webSearch(ctx, "10 year treasury yield today close percent"),
-    webSearch(ctx, "US dollar index DXY today close"),
-    webSearch(ctx, "CNN Fear and Greed Index today value"),
     Promise.all(
       symbols.map(async (s) => {
         try {
@@ -910,7 +898,7 @@ async function refreshNewsInternal(ctx: Ctx) {
         published_at: r.published_at,
       })),
   );
-  const indPool = trim([...spxSearch, ...vixSearch, ...yieldSearch, ...dxySearch, ...fgSearch], 16);
+  const indPool = [spxSearch, nasdaqSearch, vixSearch, yieldSearch].flatMap((results) => trim(results, 4));
 
   const earnPrompt = (pool: typeof earnPool) =>
     `下面是逐个公司定向搜索的网页结果（symbol_hint 是该组结果对应的公司代码）。请提取每家公司下一次财报发布日期：只提取结果中有明确日期依据的条目；symbol 用 symbol_hint 的代码（除非结果明确说的是另一家公司）；report_date 用 YYYY-MM-DD（原文如 02/24/2027 需换算）；timing 填「盘前」「盘后」或 null（未确认/estimated 也填 null 并在 source 后不加说明）；eps_est 填一致预期 EPS 的原文字符串（如 "$2.88"），没有则 null；source 填来源网站名。同一公司多条结果日期一致时只输出一条；相互矛盾时取标注 confirmed 的那条，都未确认则省略。找不到依据的公司不要编造，直接省略。\n\n${JSON.stringify(pool)}`;
@@ -927,7 +915,7 @@ async function refreshNewsInternal(ctx: Ctx) {
       : Promise.resolve(null),
     indPool.length > 0
       ? ctx.inference.complete(
-          `下面是网页搜索结果。请提取以下指标的最新数值（只能用搜索结果中有明确数字依据的，找不到就填 null，绝不估算、绝不用差价合约/CFD 报价冒充指数）：1) 标普500指数（S&P 500）最新收盘点位与当日涨跌幅 %；2) 纳斯达克100指数最新收盘点位与当日涨跌幅 %；3) VIX 恐慌指数最新点位；4) 美国10年期国债收益率（百分数，如 4.25 表示 4.25%）；5) 美元指数 DXY 最新点位；6) CNN 恐惧与贪婪指数（0-100）及其英文等级标签（如 Fear/Greed/Extreme Fear）。as_of 填该数值对应的日期（YYYY-MM-DD），不确定则 null。\n\n${JSON.stringify(indPool)}`,
+          `下面是网页搜索结果。请提取以下指标的最新数值（只能用搜索结果中有明确数字依据的，找不到就填 null，绝不估算、绝不用差价合约/CFD 报价冒充指数）：1) 标普500指数（S&P 500）最新收盘点位与当日涨跌幅 %；2) 纳斯达克100指数最新收盘点位与当日涨跌幅 %；3) VIX 恐慌指数最新点位；4) 美国10年期国债收益率（百分数，如 4.25 表示 4.25%）。as_of 填该数值对应的日期（YYYY-MM-DD），不确定则 null。\n\n${JSON.stringify(indPool)}`,
           { schema: indicatorDistillSchema },
         )
       : Promise.resolve(null),
@@ -1021,8 +1009,6 @@ async function refreshNewsInternal(ctx: Ctx) {
     await put("NAS100", distilled.nas100.value, distilled.nas100.as_of, distilled.nas100.change_pct);
     await put("VIX", distilled.vix.value, distilled.vix.as_of);
     await put("TNX10Y", distilled.tnx10y.value, distilled.tnx10y.as_of, null, "单位：%");
-    await put("DXY", distilled.dxy.value, distilled.dxy.as_of);
-    await put("FEAR_GREED", distilled.fear_greed.value, distilled.fear_greed.as_of, null, distilled.fear_greed.label);
 
     // 指数下跌预警（状态机跨越触发）
     const today = etDate();
@@ -1078,7 +1064,7 @@ async function refreshNewsInternal(ctx: Ctx) {
   await logRun(
     db,
     "news",
-    errors.length >= 3 ? "error" : "ok",
+    errors.length >= 3 ? "error" : errors.length > 0 ? "partial" : "ok",
     `新增新闻 ${newsAdded} 条、财报 ${earningsAdded} 条${errors.length ? `；部分失败：${errors.join("；")}` : ""}`,
     started,
   );
@@ -1092,12 +1078,12 @@ async function generateReportInternal(ctx: Ctx, kind: "daily" | "weekly") {
   const db = ctx.db<typeof schema>();
   await ensureSeeded(db);
   const started = new Date();
-  const today = etDate();
+  const today = marketStatusNow(started).lastClosedTradingDay;
 
   const watch = await db.select().from(schema.watchlist);
   const quoteRows = await db.select().from(schema.quotes);
   const indRows = await db.select().from(schema.indicators);
-  const miRows = await db.select().from(schema.marketIndicators);
+  const miRows = await db.select().from(schema.marketIndicators).where(inArray(schema.marketIndicators.key, MARKET_KEYS));
   const posRows = await db.select().from(schema.positions);
   const newsRows = await db.select().from(schema.news).orderBy(desc(schema.news.id)).limit(12);
   const alertRows = await db.select().from(schema.alerts).orderBy(desc(schema.alerts.id)).limit(12);
@@ -1212,6 +1198,16 @@ async function generateReportInternal(ctx: Ctx, kind: "daily" | "weekly") {
     content = lines.join("\n");
   }
 
+  const reportSymbols = [...new Set([...watch, ...posRows].map((row) => row.symbol))];
+  const datedQuotes = reportSymbols.filter((symbol) => {
+    const quote = qMap.get(symbol);
+    const asOf = quote?.asOf;
+    if (quote?.price == null || !asOf) return false;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(asOf)) return asOf === today;
+    const timestamp = new Date(asOf);
+    return Number.isFinite(timestamp.getTime()) && etDate(timestamp) === today;
+  }).length;
+  content = `> 报价覆盖 ${datedQuotes}/${reportSymbols.length} · ${today} ET（按观测日期统计）\n\n${content}`;
   const period = kind === "daily" ? today : `${today} 当周`;
   const title = kind === "daily" ? `${today} 每日投资报告` : `${period} 每周投资报告`;
   const inserted = await db
@@ -1236,50 +1232,56 @@ async function generateReportInternal(ctx: Ctx, kind: "daily" | "weekly") {
 async function scheduledRefreshInternal(ctx: Ctx) {
   const db = ctx.db<typeof schema>();
   const started = new Date();
+  const calendar = marketStatusNow(started);
+  const hasClosed = calendar.isTradingDay && calendar.lastClosedTradingDay === calendar.todayET;
   const parts: string[] = [];
-  // 交易日历守卫：若美东当日休市（假日/周末），没有新交易数据，跳过日报
-  // 生成（避免重复报告）；行情与资讯仍照常刷新（幂等，可修正存量数据）。
-  const status = marketStatusNow();
-  if (!status.isTradingDay) {
-    parts.push(
-      status.holidayName
-        ? `美东 ${status.todayET} 休市（${status.holidayName}），跳过日报生成`
-        : `美东 ${status.todayET} 为周末非交易日，跳过日报生成`,
-    );
-  }
-  if (status.earlyClose) {
-    parts.push(`今日美东提前收盘（13:00 ET，${status.earlyCloseNote ?? ""}）`);
+  let errors = 0;
+  let marketUpdated = 0;
+  let servicesSucceeded = 0;
+  if (!calendar.isTradingDay) parts.push(`美东 ${calendar.todayET} 休市，跳过日报生成`);
+  if (calendar.isTradingDay && !hasClosed) parts.push("常规交易尚未收盘，跳过报告生成");
+  if (calendar.earlyClose) parts.push(`美东提前收盘（${calendar.closeTimeET} ET）`);
+  try {
+    const result = await refreshMarketInternal(ctx, true);
+    marketUpdated = result.updated;
+    if (result.updated > 0) servicesSucceeded++;
+    if (result.failed.length > 0) errors++;
+    parts.push(`行情更新 ${result.updated} 个标的，新增预警 ${result.newAlerts} 条${result.failed.length ? `，失败 ${result.failed.join("、")}` : ""}`);
+  } catch (error) {
+    errors++;
+    parts.push(`行情失败：${error instanceof Error ? error.message.slice(0, 100) : "未知错误"}`);
   }
   try {
-    const m = await refreshMarketInternal(ctx, true);
-    parts.push(`行情更新 ${m.updated} 个标的，新增预警 ${m.newAlerts} 条`);
-  } catch (e) {
-    parts.push(`行情失败：${e instanceof Error ? e.message.slice(0, 100) : "未知错误"}`);
+    const result = await refreshNewsInternal(ctx);
+    if (result.errors.length < 3) servicesSucceeded++;
+    if (result.errors.length > 0) errors++;
+    parts.push(`新闻 +${result.newsAdded}，财报 +${result.earningsAdded}${result.errors.length ? `；${result.errors.join("；")}` : ""}`);
+  } catch (error) {
+    errors++;
+    parts.push(`资讯失败：${error instanceof Error ? error.message.slice(0, 100) : "未知错误"}`);
   }
-  try {
-    const n = await refreshNewsInternal(ctx);
-    parts.push(`新闻 +${n.newsAdded}，财报 +${n.earningsAdded}`);
-  } catch (e) {
-    parts.push(`新闻失败：${e instanceof Error ? e.message.slice(0, 100) : "未知错误"}`);
-  }
-  if (!status.isTradingDay) {
-    await logRun(db, "full", "ok", parts.join("；"), started);
-    ctx.invalidateQueries();
-    return { detail: parts.join("；") };
-  }
-  try {
-    const r = await generateReportInternal(ctx, "daily");
-    parts.push(`日报已生成（#${r.id}）`);
-    if (etWeekday() === "Fri") {
-      const w = await generateReportInternal(ctx, "weekly");
-      parts.push(`周报已生成（#${w.id}）`);
+  if (hasClosed && marketUpdated > 0) {
+    try {
+      const daily = await generateReportInternal(ctx, "daily");
+      parts.push(`日报已生成（#${daily.id}）`);
+      const nextWeekday = new Date(`${nextTradingDay(calendar.todayET)}T12:00:00Z`).getUTCDay();
+      const currentWeekday = new Date(`${calendar.todayET}T12:00:00Z`).getUTCDay();
+      if (nextWeekday <= currentWeekday) {
+        const weekly = await generateReportInternal(ctx, "weekly");
+        parts.push(`周报已生成（#${weekly.id}）`);
+      }
+    } catch (error) {
+      errors++;
+      parts.push(`报告失败：${error instanceof Error ? error.message.slice(0, 100) : "未知错误"}`);
     }
-  } catch (e) {
-    parts.push(`报告失败：${e instanceof Error ? e.message.slice(0, 100) : "未知错误"}`);
+  } else if (hasClosed) {
+    parts.push("无更新的标的行情，跳过报告生成");
   }
-  await logRun(db, "full", "ok", parts.join("；"), started);
+  const status = errors ? (servicesSucceeded ? "partial" : "error") : hasClosed && marketUpdated > 0 ? "ok" : "skipped";
+  const detail = parts.join("；");
+  await logRun(db, "full", status, detail, started);
   ctx.invalidateQueries();
-  return { detail: parts.join("；") };
+  return { detail };
 }
 
 // ---------- 响应结构 ----------
@@ -1342,6 +1344,7 @@ const dashboardResponse = z.object({
     dstLabel: z.string(),
     beijingSession: z.string(),
     lastTradingDay: z.string(),
+    lastClosedTradingDay: z.string(),
     nextTradingDay: z.string(),
     dst2026: z.string(),
     dst2027: z.string(),
@@ -1361,6 +1364,7 @@ const dashboardResponse = z.object({
       pnlPct: nullableNum,
       weightPct: nullableNum,
       ddFromPeak: nullableNum,
+      quoteAsOf: z.string().nullable(),
       createdAt: z.string(),
     }),
   ),
@@ -1378,6 +1382,7 @@ const dashboardResponse = z.object({
       level: z.string(),
       title: z.string(),
       detail: z.string(),
+      tradeDate: z.string().nullable(),
       createdAt: z.string(),
     }),
   ),
@@ -1493,9 +1498,10 @@ export const Actions = {
       const qMap = new Map(quoteRows.map((q) => [q.symbol, q]));
       const iMap = new Map(indRows.map((i) => [i.symbol, i]));
 
-      const bars = await db
-        .select()
+      const bars = watch.length === 0 ? [] : await db
+        .select({ symbol: schema.dailyBars.symbol, close: schema.dailyBars.close })
         .from(schema.dailyBars)
+        .where(inArray(schema.dailyBars.symbol, watch.map((row) => row.symbol)))
         .orderBy(asc(schema.dailyBars.date));
       const sparkMap = new Map<string, number[]>();
       for (const b of bars) {
@@ -1570,6 +1576,7 @@ export const Actions = {
         dstLabel: cal.dstLabel,
         beijingSession: cal.beijingSession,
         lastTradingDay: cal.lastTradingDay,
+        lastClosedTradingDay: cal.lastClosedTradingDay,
         nextTradingDay: cal.nextTradingDay,
         dst2026: `${d26.start} – ${d26.end}`,
         dst2027: `${d27.start} – ${d27.end}`,
@@ -1604,6 +1611,7 @@ export const Actions = {
             p.peakPrice != null && p.peakPrice > 0 && price != null
               ? ((p.peakPrice - price) / p.peakPrice) * 100
               : null,
+          quoteAsOf: qMap.get(p.symbol)?.asOf ?? null,
           createdAt: p.createdAt.toISOString(),
         };
       });
@@ -1612,10 +1620,12 @@ export const Actions = {
       const rulesRow = rulesRows[0];
       const alertRows = await db.select().from(schema.alerts).orderBy(desc(schema.alerts.id)).limit(50);
       const newsRows = await db.select().from(schema.news).orderBy(desc(schema.news.id)).limit(40);
-      const earnRows = await db.select().from(schema.earnings).orderBy(asc(schema.earnings.reportDate)).limit(80);
+      const earnRows = await db.select().from(schema.earnings).where(gte(schema.earnings.reportDate, cal.todayET)).orderBy(asc(schema.earnings.reportDate)).limit(80);
       const reportRows = await db.select().from(schema.reports).orderBy(desc(schema.reports.id)).limit(30);
       const runRows = await db.select().from(schema.refreshRuns).orderBy(desc(schema.refreshRuns.id)).limit(10);
+      const activeSymbols = new Set([...watch, ...posRows].map((row) => row.symbol));
       const lastQuote = quoteRows.reduce<Date | null>((acc, q) => {
+        if (!activeSymbols.has(q.symbol)) return acc;
         if (!acc || q.updatedAt > acc) return q.updatedAt;
         return acc;
       }, null);
@@ -1638,6 +1648,7 @@ export const Actions = {
           level: a.level,
           title: a.title,
           detail: a.detail,
+          tradeDate: a.dedupKey.split(":").find((part) => /^\d{4}-\d{2}-\d{2}$/.test(part)) ?? null,
           createdAt: a.createdAt.toISOString(),
         })),
         news: newsRows.map((n) => ({
@@ -1694,7 +1705,7 @@ export const Actions = {
   }),
 
   refreshNews: defineAction({
-    description: "通过网页搜索刷新重大新闻、财报日历与 VIX/10年期收益率/美元指数/恐惧贪婪等风险指标。",
+    description: "通过网页搜索刷新重大新闻、财报日历与市场风险指标。",
     request: z.object({}),
     response: z.object({
       newsAdded: z.number(),
@@ -1716,7 +1727,7 @@ export const Actions = {
   }),
 
   scheduledRefresh: defineAction({
-    description: "盘后全量刷新：行情与指标、新闻与财报、生成日报（美东周五另生成周报），供定时任务调用。",
+    description: "盘后全量刷新：行情与指标、新闻与财报、生成日报（本周最后一个交易日另生成周报），供定时任务调用。",
     request: z.object({}),
     response: z.object({ detail: z.string() }),
     async handler(ctx) {
@@ -1747,16 +1758,6 @@ export const Actions = {
         if (cand.getTime() <= from.getTime()) cand.setUTCDate(cand.getUTCDate() + 1);
         return cand;
       };
-      const nextSaturday6 = (from = new Date()): Date => {
-        const d = bjTime(6, 0, from);
-        // bjTime 返回未来某天 06:00（北京时间）；向前滚动到周六
-        for (let i = 0; i < 8; i++) {
-          const bj = new Date(d.getTime() + 8 * 3600 * 1000);
-          if (bj.getUTCDay() === 6 && d.getTime() > from.getTime()) return d;
-          d.setUTCDate(d.getUTCDate() + 1);
-        }
-        return d;
-      };
       const taskOf = (
         name: string,
         owner: string,
@@ -1785,7 +1786,7 @@ export const Actions = {
         taskOf(
           "盘后全量刷新（行情+资讯+日报）",
           "本 Space 定时任务",
-          "每日 05:30（北京时间，冬令时盘后；夏令时为 04:30）",
+          "每日 05:30（北京时间）",
           "平台行情通道 + 公开来源提炼",
           ["full"],
           bjTime(5, 30),
@@ -1800,7 +1801,7 @@ export const Actions = {
           source: "主助手任务系统（执行记录不在本 Space 数据库内）",
           lastSuccessAt: null,
           lastRunAt: null,
-          nextRunAt: bjTime(22, 0).toISOString(),
+          nextRunAt: null,
           lastDurationMs: null,
           lastStatus: null,
           lastDetail: "由主助手调度并推送到聊天；本页仅列计划时间，执行明细见主助手任务记录。",
@@ -1812,7 +1813,7 @@ export const Actions = {
           source: "主助手任务系统（执行记录不在本 Space 数据库内）",
           lastSuccessAt: null,
           lastRunAt: null,
-          nextRunAt: bjTime(5, 30).toISOString(),
+          nextRunAt: null,
           lastDurationMs: null,
           lastStatus: null,
           lastDetail: "由主助手调度并推送到聊天；本页仅列计划时间，执行明细见主助手任务记录。",
@@ -1824,7 +1825,7 @@ export const Actions = {
           source: "主助手任务系统（执行记录不在本 Space 数据库内）",
           lastSuccessAt: null,
           lastRunAt: null,
-          nextRunAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+          nextRunAt: null,
           lastDurationMs: null,
           lastStatus: null,
           lastDetail: "由主助手调度；无重要变化时不推送。本页仅列计划，执行明细见主助手任务记录。",
@@ -1836,7 +1837,7 @@ export const Actions = {
           source: "主助手任务系统（执行记录不在本 Space 数据库内）",
           lastSuccessAt: null,
           lastRunAt: null,
-          nextRunAt: nextSaturday6().toISOString(),
+          nextRunAt: null,
           lastDurationMs: null,
           lastStatus: null,
           lastDetail: "由主助手调度并推送到聊天；本页仅列计划时间，执行明细见主助手任务记录。",
@@ -1856,7 +1857,7 @@ export const Actions = {
           lastAttemptAt: lastQuoteFetch ? lastQuoteFetch.toISOString() : null,
           state: lastQuoteFetch ? "已获取" : "尚未刷新",
         },
-        ...miRows.map((m) => ({
+        ...miRows.filter((m) => MARKET_KEYS.some((key) => key === m.key)).map((m) => ({
           name: m.label,
           source: m.source || "尚未刷新",
           quoteAsOf: m.asOf,
@@ -1993,7 +1994,7 @@ export const Actions = {
       const earns = await db
         .select()
         .from(schema.earnings)
-        .where(eq(schema.earnings.symbol, sym))
+        .where(and(eq(schema.earnings.symbol, sym), gte(schema.earnings.reportDate, etDate())))
         .orderBy(asc(schema.earnings.reportDate));
       const allNews = await db.select().from(schema.news).orderBy(desc(schema.news.id)).limit(100);
       const relNews = allNews.filter((n) => n.symbols.split(",").includes(sym)).slice(0, 10);
@@ -2033,16 +2034,13 @@ export const Actions = {
   }),
 
   removeSymbol: defineAction({
-    description: "从监控列表移除一个标的。注意：该标的的行情快照、技术指标与日线历史会一并删除（不可恢复）；历史预警、新闻、财报与持仓记录保留不受影响。",
+    description: "取消关注标的，保留历史数据与持仓监控。",
     request: z.object({ symbol: z.string().min(1).max(12) }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
       const db = ctx.db<typeof schema>();
       const sym = args.symbol.toUpperCase();
       await db.delete(schema.watchlist).where(eq(schema.watchlist.symbol, sym));
-      await db.delete(schema.quotes).where(eq(schema.quotes.symbol, sym));
-      await db.delete(schema.indicators).where(eq(schema.indicators.symbol, sym));
-      await db.delete(schema.dailyBars).where(eq(schema.dailyBars.symbol, sym));
       ctx.invalidateQueries();
       return { ok: true };
     },

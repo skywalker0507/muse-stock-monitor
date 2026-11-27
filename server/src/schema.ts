@@ -162,7 +162,7 @@ export const reports = sqliteTable("reports", {
 export const refreshRuns = sqliteTable("refresh_runs", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   kind: text("kind").notNull(), // market / news / report / full
-  status: text("status", { enum: ["ok", "error"] }).notNull(),
+  status: text("status", { enum: ["ok", "partial", "error", "skipped"] }).notNull(),
   detail: text("detail").notNull().default(""),
   startedAt: integer("started_at", { mode: "timestamp_ms" }).notNull(),
   finishedAt: integer("finished_at", { mode: "timestamp_ms" }).notNull(),
